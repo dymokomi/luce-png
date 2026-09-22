@@ -1,0 +1,25 @@
+#prisma 4.0
+def package "luce-png" {
+    str owner = "dymokomi"
+    str version = "0.1.0"
+    str kind = "package"
+    str language = "luce-base"
+    str description = "A PNG decoder and encoder for Luce/Base."
+    str readme = "README.md"
+
+    def dependency "luce-raster" {
+        str owner = "dymokomi"
+        str version = "^0.1.0"
+        str path = "../luce-raster"
+    }
+
+    def dependency "luce-deflate" {
+        str owner = "dymokomi"
+        str version = "^0.1.0"
+        str path = "../luce-deflate"
+    }
+
+    def export "png" {
+        str module = "luce_png.png"
+    }
+}

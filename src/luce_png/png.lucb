@@ -1,0 +1,221 @@
+## Static PNG, all standard color types/bit depths and Adam7 interlacing.
+import memory
+import math
+from binary import Reader, Buffer
+from raster import Raster, SampleType
+from raster_errors import corrupt, unsupported, invalid
+import deflate
+
+let signature = b"\x89PNG\r\n\x1a\n"
+
+func source_channels(color: u64) -> usize:
+    return 3 if color == 2 else 2 if color == 4 else 4 if color == 6 else 1
+
+pub func probe(image: Raster*) -> !:
+    var reader = Reader(data = image.encoded, little = false)
+    if (str)(try reader.take(8)) != (str)signature:
+        error(corrupt, "invalid PNG signature")
+    var header = false
+    var pixels = false
+    var ended_pixels = false
+    var end = false
+    while reader.position < reader.data.length:
+        let size = (usize)(try reader.uint(4))
+        let start = reader.position
+        let name = (str)(try reader.take(4))
+        let data = try reader.take(size)
+        let checksum = try reader.uint(4)
+        if (u64)deflate.crc32(reader.data[start..<start + 4 + size]) != checksum:
+            error(corrupt, "PNG CRC mismatch")
+        if not header and name != "IHDR":
+            error(corrupt, "PNG must start with IHDR")
+        if name == "IHDR":
+            if header or size != 13:
+                error(corrupt, "invalid PNG IHDR")
+            var h = Reader(data = data, little = false)
+            image.width = (usize)(try h.uint(4))
+            image.height = (usize)(try h.uint(4))
+            image.bits = (usize)(try h.byte())
+            image.photo = (u64)(try h.byte())
+            if try h.byte() != 0 or try h.byte() != 0:
+                error(unsupported, "unsupported PNG compression or filter method")
+            let interlace = try h.byte()
+            if interlace > 1:
+                error(corrupt, "invalid PNG interlace method")
+            image.interlaced = interlace == 1
+            let b = image.bits
+            let color = image.photo
+            if not ((color == 0 and (b == 1 or b == 2 or b == 4 or b == 8 or b == 16)) or (color == 3 and (b == 1 or b == 2 or b == 4 or b == 8)) or ((color == 2 or color == 4 or color == 6) and (b == 8 or b == 16))):
+                error(corrupt, "invalid PNG color type or bit depth")
+            header = true
+        elif name == "PLTE":
+            if pixels or image.palette.length != 0 or size == 0 or size > 768 or size % 3 != 0:
+                error(corrupt, "invalid PNG palette")
+            image.palette = data
+        elif name == "tRNS":
+            if pixels or image.transparency.length != 0 or (image.photo == 0 and size != 2) or (image.photo == 2 and size != 6) or (image.photo == 3 and (size == 0 or size > image.palette.length // 3)) or image.photo == 4 or image.photo == 6:
+                error(corrupt, "invalid PNG transparency")
+            image.transparency = data
+        elif name == "IDAT":
+            if ended_pixels or (image.photo == 3 and image.palette.length == 0):
+                error(corrupt, "invalid PNG IDAT order")
+            pixels = true
+        elif name == "IEND":
+            if size != 0 or not pixels or reader.position != reader.data.length:
+                error(corrupt, "invalid PNG IEND")
+            end = true
+            break
+        elif name == "acTL":
+            error(unsupported, "APNG animation is not supported")
+        elif (name.bytes[0] & 32) == 0:
+            error(unsupported, "unknown critical PNG chunk")
+        if pixels and name != "IDAT":
+            ended_pixels = true
+    if not end:
+        error(corrupt, "PNG has no IEND")
+    let nc = source_channels(image.photo)
+    let count = (3 if image.photo == 3 else nc) + (1 if image.transparency.length > 0 else 0)
+    try image.standard(count, .uint16 if image.bits == 16 else .uint8)
+    discard(try image.validate())
+    image.file_format = "PNG"
+
+let xstart: usize[7] = [0,4,0,2,0,1,0]
+let ystart: usize[7] = [0,0,4,0,2,0,1]
+let xstep: usize[7] = [8,8,4,4,2,2,1]
+let ystep: usize[7] = [8,8,8,4,4,2,2]
+
+func extent(size: usize, start: usize, step: usize) -> usize:
+    return (size - start + step - 1) // step if size > start else 0
+
+func paeth(a: i32, b: i32, c: i32) -> u8:
+    let p = a + b - c
+    let pa = p - a if p >= a else a - p
+    let pb = p - b if p >= b else b - p
+    let pc = p - c if p >= c else c - p
+    return (u8)(a if pa <= pb and pa <= pc else b if pb <= pc else c)
+
+func sample(row: const u8[], index: usize, bits: usize) -> u32:
+    if bits == 16:
+        return ((u32)row[index * 2] << 8) | (u32)row[index * 2 + 1]
+    if bits == 8:
+        return (u32)row[index]
+    return ((u32)row[index * bits // 8] >> (8 - bits - (index * bits % 8))) & (((u32)1 << bits) - 1)
+
+pub func decode(image: Raster*) -> !:
+    var packed = Buffer(maximum = image.max_bytes)
+    defer packed.close()
+    var reader = Reader(data = image.encoded, position = 8, little = false)
+    while reader.position < reader.data.length:
+        let size = (usize)(try reader.uint(4))
+        let name = (str)(try reader.take(4))
+        let data = try reader.take(size)
+        discard(try reader.uint(4))
+        if name == "IDAT":
+            try packed.put(data)
+    let nc = source_channels(image.photo)
+    let passes: usize = 7 if image.interlaced else 1
+    var expected: usize = 0
+    for pass in 0..<passes:
+        let w = extent(image.width, xstart[pass], xstep[pass]) if image.interlaced else image.width
+        let h = extent(image.height, ystart[pass], ystep[pass]) if image.interlaced else image.height
+        if w > 0 and h > 0:
+            expected += ((w * nc * image.bits + 7) // 8 + 1) * h
+    if expected > image.max_bytes:
+        error(invalid, "PNG scanlines exceed byte limit")
+    let raw = try new u8[expected] in memory.heap
+    defer free(raw) in memory.heap
+    try deflate.inflate(packed.view(), raw)
+    var offset: usize = 0
+    let bpp = (nc * image.bits + 7) // 8
+    for pass in 0..<passes:
+        let xs = xstart[pass] if image.interlaced else 0
+        let ys = ystart[pass] if image.interlaced else 0
+        let dx = xstep[pass] if image.interlaced else 1
+        let dy = ystep[pass] if image.interlaced else 1
+        let w = extent(image.width, xs, dx)
+        let h = extent(image.height, ys, dy)
+        if w == 0 or h == 0:
+            continue
+        let rowbytes = (w * nc * image.bits + 7) // 8
+        for y in 0..<h:
+            let filter_kind = raw[offset]
+            if filter_kind > 4:
+                error(corrupt, "invalid PNG row filter")
+            offset += 1
+            let row = raw[offset..<offset + rowbytes]
+            for i in 0..<rowbytes:
+                let a: u8 = row[i - bpp] if i >= bpp else 0
+                let b: u8 = raw[offset - rowbytes - 1 + i] if y > 0 else 0
+                let c: u8 = raw[offset - rowbytes - 1 + i - bpp] if y > 0 and i >= bpp else 0
+                let prediction = a if filter_kind == 1 else b if filter_kind == 2 else (u8)(((u32)a + (u32)b) // 2) if filter_kind == 3 else paeth((i32)a, (i32)b, (i32)c) if filter_kind == 4 else 0
+                row[i] +%= prediction
+            for x in 0..<w:
+                let target = ((ys + y * dy) * image.width + xs + x * dx) * image.channels.length
+                if image.photo == 3:
+                    let index = (usize)sample(row, x, image.bits)
+                    if index >= image.palette.length // 3:
+                        error(corrupt, "PNG palette index out of range")
+                    for c in 0..<(usize)3:
+                        image.pixels[target + c] = (f64)image.palette[index * 3 + c]
+                    if image.channels.length == 4:
+                        image.pixels[target + 3] = (f64)image.transparency[index] if index < image.transparency.length else 255.0
+                else:
+                    var transparent = image.transparency.length > 0
+                    for c in 0..<nc:
+                        let value = sample(row, x * nc + c, image.bits)
+                        image.pixels[target + c] = (f64)value * 255.0 / (f64)(((u32)1 << image.bits) - 1) if image.bits < 8 else (f64)value
+                        if transparent:
+                            let key = ((u32)image.transparency[c * 2] << 8) | (u32)image.transparency[c * 2 + 1]
+                            transparent = value == key
+                    if image.transparency.length > 0:
+                        image.pixels[target + nc] = 0.0 if transparent else 65535.0 if image.bits == 16 else 255.0
+            offset += rowbytes
+
+func chunk(output: Buffer*, name: str, data: const u8[]) -> !:
+    try output.uint((u64)data.length, 4, false)
+    let start = output.used
+    try output.text(name)
+    try output.put(data)
+    let checksum = deflate.crc32(output.view()[start..])
+    try output.uint((u64)checksum, 4, false)
+
+pub func encode(image: const Raster*, output: Buffer*) -> !:
+    let nc = image.channels.length
+    if nc > 4:
+        error(unsupported, "PNG supports at most four channels")
+    let kind = image.channels[0].kind
+    if kind != .uint8 and kind != .uint16:
+        error(unsupported, "PNG requires uint8 or uint16 channels")
+    for c in image.channels:
+        if c.kind != kind:
+            error(unsupported, "PNG requires matching channel sample types")
+    let bits: usize = 16 if kind == .uint16 else 8
+    var header = Buffer()
+    defer header.close()
+    try header.uint((u64)image.width, 4, false)
+    try header.uint((u64)image.height, 4, false)
+    try header.byte((u8)bits)
+    try header.byte(0 if nc == 1 else 4 if nc == 2 else 2 if nc == 3 else 6)
+    try header.put(b"\0\0\0")
+    try output.put(signature)
+    try chunk(output, "IHDR", header.view())
+    var rows = Buffer(maximum = image.max_bytes)
+    defer rows.close()
+    for y in 0..<image.height:
+        try rows.byte(1)
+        let start = rows.used
+        for i in 0..<image.width * nc:
+            let value = image.pixels[y * image.width * nc + i]
+            if not math.is_finite(value) or value < 0.0 or value > (65535.0 if bits == 16 else 255.0) or math.floor(value) != value:
+                error(invalid, "PNG sample is outside its integer range")
+            try rows.uint((u64)value, bits // 8, false)
+        var i = rows.used - start
+        let stride = nc * (bits // 8)
+        while i > stride:
+            i -= 1
+            rows.data[start + i] -%= rows.data[start + i - stride]
+    var compressed = Buffer(maximum = image.max_bytes)
+    defer compressed.close()
+    try deflate.compress(rows.view(), &compressed)
+    try chunk(output, "IDAT", compressed.view())
+    try chunk(output, "IEND", b"")

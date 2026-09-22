@@ -1,0 +1,43 @@
+name: Correctness
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: luce-png
+      - id: pins
+        run: |
+          echo "base=$(cat luce-png/bootstrap/BASE)" >> "$GITHUB_OUTPUT"
+          echo "raster=$(cat luce-png/bootstrap/RASTER)" >> "$GITHUB_OUTPUT"
+          echo "deflate=$(cat luce-png/bootstrap/DEFLATE)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: dymokomi/luce-base
+          ref: ${{ steps.pins.outputs.base }}
+          path: luce-base
+      - uses: actions/checkout@v7
+        with:
+          repository: dymokomi/luce-raster
+          ref: ${{ steps.pins.outputs.raster }}
+          path: luce-raster
+      - uses: actions/checkout@v7
+        with:
+          repository: dymokomi/luce-deflate
+          ref: ${{ steps.pins.outputs.deflate }}
+          path: luce-deflate
+      - name: Select Clang
+        run: |
+          mkdir -p "$RUNNER_TEMP/luce-bin"
+          ln -s "$(command -v clang)" "$RUNNER_TEMP/luce-bin/cc"
+          echo "$RUNNER_TEMP/luce-bin" >> "$GITHUB_PATH"
+      - run: cd luce-base && ./build.sh
+      - run: ./test.sh
