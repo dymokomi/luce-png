@@ -4,7 +4,7 @@ import math
 from binary import Reader, Buffer
 from raster import Raster, SampleType
 from raster_errors import corrupt, unsupported, invalid
-import deflate
+import compress
 
 let signature = b"\x89PNG\r\n\x1a\n"
 
@@ -25,7 +25,7 @@ pub func probe(image: Raster*) -> !:
         let name = (str)(try reader.take(4))
         let data = try reader.take(size)
         let checksum = try reader.uint(4)
-        if (u64)deflate.crc32(reader.data[start..<start + 4 + size]) != checksum:
+        if (u64)compress.crc32(reader.data[start..<start + 4 + size]) != checksum:
             error(corrupt, "PNG CRC mismatch")
         if not header and name != "IHDR":
             error(corrupt, "PNG must start with IHDR")
@@ -124,7 +124,7 @@ pub func decode(image: Raster*) -> !:
         error(invalid, "PNG scanlines exceed byte limit")
     let raw = try new u8[expected] in memory.heap
     defer free(raw) in memory.heap
-    try deflate.inflate(packed.view(), raw)
+    try compress.inflate(packed.view(), raw)
     var offset: usize = 0
     let bpp = (nc * image.bits + 7) // 8
     for pass in 0..<passes:
@@ -176,7 +176,7 @@ func chunk(output: Buffer*, name: str, data: const u8[]) -> !:
     let start = output.used
     try output.text(name)
     try output.put(data)
-    let checksum = deflate.crc32(output.view()[start..])
+    let checksum = (u32)compress.crc32(output.view()[start..])
     try output.uint((u64)checksum, 4, false)
 
 pub func encode(image: const Raster*, output: Buffer*) -> !:
@@ -216,6 +216,8 @@ pub func encode(image: const Raster*, output: Buffer*) -> !:
             rows.data[start + i] -%= rows.data[start + i - stride]
     var compressed = Buffer(maximum = image.max_bytes)
     defer compressed.close()
-    try deflate.compress(rows.view(), &compressed)
+    let packed = try compress.compress(rows.view())
+    defer free(packed) in memory.heap
+    try compressed.put(packed)
     try chunk(output, "IDAT", compressed.view())
     try chunk(output, "IEND", b"")

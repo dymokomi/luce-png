@@ -18,7 +18,7 @@ jobs:
         run: |
           echo "base=$(cat luce-png/bootstrap/BASE)" >> "$GITHUB_OUTPUT"
           echo "raster=$(cat luce-png/bootstrap/RASTER)" >> "$GITHUB_OUTPUT"
-          echo "deflate=$(cat luce-png/bootstrap/DEFLATE)" >> "$GITHUB_OUTPUT"
+          echo "compress=$(cat luce-png/bootstrap/COMPRESS)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
         with:
           repository: dymokomi/luce-base
@@ -31,9 +31,9 @@ jobs:
           path: luce-raster
       - uses: actions/checkout@v7
         with:
-          repository: dymokomi/luce-deflate
-          ref: ${{ steps.pins.outputs.deflate }}
-          path: luce-deflate
+          repository: dymokomi/luce-compress
+          ref: ${{ steps.pins.outputs.compress }}
+          path: luce-compress
       - name: Select Clang
         run: |
           mkdir -p "$RUNNER_TEMP/luce-bin"
