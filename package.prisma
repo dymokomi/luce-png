@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-png" {
     str owner = "dymokomi"
-    str version = "0.1.1"
+    str version = "0.1.2"
     str kind = "package"
     str language = "luce-base"
     str description = "A PNG decoder and encoder for Luce/Base."
@@ -21,5 +21,11 @@ def package "luce-png" {
 
     def export "png" {
         str module = "luce_png.png"
+    }
+
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str version = "^0.1.0"
+        str path = "../luce-std"
     }
 }

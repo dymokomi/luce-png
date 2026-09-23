@@ -24,6 +24,16 @@ jobs:
           repository: dymokomi/luce-base
           ref: ${{ steps.pins.outputs.base }}
           path: luce-base
+      - name: Check out the pinned library packages
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          while read -r name revision; do
+            [ -n "$name" ] || continue
+            git init -q "$name"
+            git -C "$name" fetch -q --depth 1 "https://github.com/dymokomi/$name.git" "$revision"
+            git -C "$name" checkout -q --detach FETCH_HEAD
+          done < luce-png/bootstrap/PACKAGES
       - uses: actions/checkout@v7
         with:
           repository: dymokomi/luce-raster
