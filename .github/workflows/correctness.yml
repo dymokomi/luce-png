@@ -52,3 +52,4 @@ jobs:
           echo "$RUNNER_TEMP/luce-bin" >> "$GITHUB_PATH"
       - run: cd luce-base && ./build.sh
       - run: ./test.sh
+        working-directory: luce-png
