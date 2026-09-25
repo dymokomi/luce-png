@@ -1,0 +1,144 @@
+#==============================================================================================
+#
+#   png/chunks - Chunk parsing, the header, palette and transparency
+#
+#==============================================================================================
+
+## Where an IDAT chunk's data is in the file.
+struct Piece:
+    var start: usize
+    var length: usize
+
+## A parsed PNG: its header, palette, transparency, the IDAT chunks in order, and
+## the band layout from a `luPD` chunk (0 bands without one).
+struct Parsed:
+    var info: Info
+    var palette: const u8[]
+    var transparency: const u8[]
+    var pieces: Piece[]
+    var count: usize
+    var bands: usize
+    var band_rows: usize
+
+    mutating func close():
+        if self.pieces.length > 0:
+            free(self.pieces) in memory.heap
+        var empty: Piece[]
+        self.pieces = empty
+
+    ## The IDAT data of chunk `index`.
+    func piece(data: const u8[], index: usize) -> const u8[]:
+        let p = self.pieces[index]
+        return data[p.start..<p.start + p.length]
+
+    ## Every IDAT chunk's CRC, checked on up to `threads` threads.
+    func check_idat(data: const u8[], threads: usize) -> !:
+        var job = CrcJob(data = data, pieces = self.pieces[..<self.count], failed = false)
+        try run_tasks(crc_task, (void*)&job, self.count, threads)
+        if job.failed:
+            error(corrupt, "PNG CRC mismatch")
+
+struct CrcJob:
+    var data: const u8[]
+    var pieces: const Piece[]
+    var failed: bool
+
+func crc_task(context: void*, index: usize):
+    let job = (CrcJob*)context
+    if not chunk_crc_ok(job.data, job.pieces[index].start - 4, job.pieces[index].length):
+        job.failed = true
+
+## Whether the chunk whose type starts at `at` with `length` data bytes has its CRC.
+func chunk_crc_ok(data: const u8[], at: usize, length: usize) -> bool:
+    let end = at + 4 + length
+    let stored = ((u32)data[end] << 24) | ((u32)data[end + 1] << 16) | ((u32)data[end + 2] << 8) | (u32)data[end + 3]
+    return flate.crc32(data[at..<end]) == stored
+
+## Walk the chunks, validating their order and contents; `check_idat` also checks
+## the IDAT CRCs (decoding checks them in parallel otherwise).
+func parse(data: const u8[], check_idat: bool) -> Parsed!:
+    var result = Parsed()
+    errdefer result.close()
+    var reader = Reader(data = data, little = false)
+    if (str)(try reader.take(8)) != (str)signature:
+        error(corrupt, "invalid PNG signature")
+    var header = false
+    var pixels = false
+    var ended_pixels = false
+    var end = false
+    var chunks: usize = 0
+    while reader.position < reader.data.length:
+        let size = (usize)(try reader.uint(4))
+        let start = reader.position
+        let name = (str)(try reader.take(4))
+        let body = try reader.take(size)
+        discard(try reader.uint(4))
+        chunks += 1
+        if name != "IDAT" or check_idat:
+            if not chunk_crc_ok(data, start, size):
+                error(corrupt, "PNG CRC mismatch")
+        if not header and name != "IHDR":
+            error(corrupt, "PNG must start with IHDR")
+        if name == "IHDR":
+            if header or size != 13:
+                error(corrupt, "invalid PNG IHDR")
+            var h = Reader(data = body, little = false)
+            result.info.width = (usize)(try h.uint(4))
+            result.info.height = (usize)(try h.uint(4))
+            result.info.bits = (usize)(try h.byte())
+            result.info.color = (usize)(try h.byte())
+            if try h.byte() != 0 or try h.byte() != 0:
+                error(unsupported, "unsupported PNG compression or filter method")
+            let interlace = try h.byte()
+            if interlace > 1:
+                error(corrupt, "invalid PNG interlace method")
+            result.info.interlaced = interlace == 1
+            let b = result.info.bits
+            let color = result.info.color
+            if not ((color == 0 and (b == 1 or b == 2 or b == 4 or b == 8 or b == 16)) or (color == 3 and (b == 1 or b == 2 or b == 4 or b == 8)) or ((color == 2 or color == 4 or color == 6) and (b == 8 or b == 16))):
+                error(corrupt, "invalid PNG color type or bit depth")
+            if result.info.width == 0 or result.info.height == 0 or result.info.width > 1000000 or result.info.height > 1000000:
+                error(invalid, "invalid dimensions or channel count")
+            header = true
+        elif name == "PLTE":
+            if pixels or result.palette.length != 0 or size == 0 or size > 768 or size % 3 != 0:
+                error(corrupt, "invalid PNG palette")
+            result.palette = body
+        elif name == "tRNS":
+            let color = result.info.color
+            if pixels or result.transparency.length != 0 or (color == 0 and size != 2) or (color == 2 and size != 6) or (color == 3 and (size == 0 or size > result.palette.length // 3)) or color == 4 or color == 6:
+                error(corrupt, "invalid PNG transparency")
+            result.transparency = body
+        elif name == "IDAT":
+            if ended_pixels or (result.info.color == 3 and result.palette.length == 0):
+                error(corrupt, "invalid PNG IDAT order")
+            pixels = true
+            if result.count == result.pieces.length:
+                let grown = try alloc Piece[result.count * 2 + 16] in memory.heap
+                for i in 0..<result.count:
+                    grown[i] = result.pieces[i]
+                if result.pieces.length > 0:
+                    free(result.pieces) in memory.heap
+                result.pieces = grown
+            result.pieces[result.count] = Piece(start = start + 4, length = size)
+            result.count += 1
+        elif name == "IEND":
+            if size != 0 or not pixels or reader.position != reader.data.length:
+                error(corrupt, "invalid PNG IEND")
+            end = true
+            break
+        elif name == "luPD":
+            # This encoder's band layout: version, rows a band, bands.
+            if size == 9 and body[0] == 1:
+                result.band_rows = (usize)(((u32)body[1] << 24) | ((u32)body[2] << 16) | ((u32)body[3] << 8) | (u32)body[4])
+                result.bands = (usize)(((u32)body[5] << 24) | ((u32)body[6] << 16) | ((u32)body[7] << 8) | (u32)body[8])
+        elif name == "acTL":
+            error(unsupported, "APNG animation is not supported")
+        elif (name.bytes[0] & 32) == 0:
+            error(unsupported, "unknown critical PNG chunk")
+        if pixels and name != "IDAT":
+            ended_pixels = true
+    if not end:
+        error(corrupt, "PNG has no IEND")
+    result.info.alpha = result.info.color == 4 or result.info.color == 6 or result.transparency.length > 0
+    return result

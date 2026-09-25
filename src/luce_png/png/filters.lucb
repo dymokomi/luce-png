@@ -1,0 +1,234 @@
+#==============================================================================================
+#
+#   png/filters - Filtering and unfiltering rows
+#
+#   DESCRIPTION:
+#       The five filters predict each byte from the byte a pixel to the left (a), the
+#       one above (b) and above-left (c). Paeth is branch-free: which of a, b, c is
+#       nearest a + b - c is data a predictor cannot learn.
+#
+#       The encoder picks a filter per row by libpng's heuristic, the smallest sum of
+#       residuals read as signed bytes, over all five in one pass. A band's first row
+#       may use only None or Sub, so bands never need the row before them.
+#
+#==============================================================================================
+
+## Branch-free Paeth predictor of a, b, c.
+inline func paeth(a: i32, b: i32, c: i32) -> i32:
+    let pa = absolute(b - c)
+    let pb = absolute(a - c)
+    let pc = absolute(a + b - c - c)
+    let use_a = (i32)(pa <= pb) & (i32)(pa <= pc)
+    let use_b = (1 - use_a) & (i32)(pb <= pc)
+    return c ^ ((a ^ c) & -use_a) ^ ((b ^ c) & -use_b)
+
+inline func absolute(x: i32) -> i32:
+    let sign = x >> 31
+    return (x ^ sign) - sign
+
+## Undo filter `kind` on the `length` bytes at `row`, in place, from the unfiltered
+## row `above` (none for the first row); `bpp` bytes a pixel (at least one). False
+## for an unknown filter.
+func unfilter(kind: u8, row: u8*, above: const u8*?, length: usize, bpp: usize) -> bool:
+    if kind == 0:
+        return true
+    if kind > 4:
+        return false
+    let lead = bpp if bpp < length else length
+    if kind == 1:
+        for i in bpp..<length:
+            row[i] = row[i] +% row[i - bpp]
+        return true
+    if let up = above:
+        if kind == 2:
+            for i in 0..<length:
+                row[i] = row[i] +% up[i]
+        elif kind == 3:
+            for i in 0..<lead:
+                row[i] = row[i] +% (u8)((u32)up[i] >> 1)
+            for i in lead..<length:
+                row[i] = row[i] +% (u8)(((u32)row[i - bpp] + (u32)up[i]) >> 1)
+        else:
+            for i in 0..<lead:
+                row[i] = row[i] +% up[i]
+            # Paeth, written out: the compiler does not inline.
+            for i in lead..<length:
+                let a = (i32)row[i - bpp]
+                let b = (i32)up[i]
+                let c = (i32)up[i - bpp]
+                let db = b - c
+                let da = a - c
+                let pa = (db ^ (db >> 31)) - (db >> 31)
+                let pb = (da ^ (da >> 31)) - (da >> 31)
+                let dc = da + db
+                let pc = (dc ^ (dc >> 31)) - (dc >> 31)
+                let use_a = (i32)(pa <= pb) & (i32)(pa <= pc)
+                let use_b = (1 - use_a) & (i32)(pb <= pc)
+                row[i] = row[i] +% (u8)(c ^ ((a ^ c) & -use_a) ^ ((b ^ c) & -use_b))
+        return true
+    # The first row: the row above is zeros, so Up is None and Paeth is Sub.
+    if kind == 3:
+        for i in lead..<length:
+            row[i] = row[i] +% (row[i - bpp] >> 1)
+    elif kind == 4:
+        for i in lead..<length:
+            row[i] = row[i] +% row[i - bpp]
+    return true
+
+## Undo filter `kind` on bytes `start..<end` of the row at `row` (the bytes
+## before `start` already unfiltered), as `unfilter` does for a whole row.
+func unfilter_span(kind: u8, row: u8*, above: const u8*?, start: usize, end: usize, bpp: usize) -> bool:
+    if kind == 0:
+        return true
+    if kind > 4:
+        return false
+    let lead = bpp if bpp < end else end
+    let first = start if start > lead else lead
+    if kind == 1:
+        for i in first..<end:
+            row[i] = row[i] +% row[i - bpp]
+        return true
+    if let up = above:
+        if kind == 2:
+            for i in start..<end:
+                row[i] = row[i] +% up[i]
+            return true
+        for i in start..<(lead if lead > start else start):
+            row[i] = row[i] +% (up[i] >> 1 if kind == 3 else up[i])
+        if kind == 3:
+            for i in first..<end:
+                row[i] = row[i] +% (u8)(((u32)row[i - bpp] + (u32)up[i]) >> 1)
+            return true
+        for i in first..<end:
+            let a = (i32)row[i - bpp]
+            let b = (i32)up[i]
+            let c = (i32)up[i - bpp]
+            let db = b - c
+            let da = a - c
+            let pa = (db ^ (db >> 31)) - (db >> 31)
+            let pb = (da ^ (da >> 31)) - (da >> 31)
+            let dc = da + db
+            let pc = (dc ^ (dc >> 31)) - (dc >> 31)
+            let use_a = (i32)(pa <= pb) & (i32)(pa <= pc)
+            let use_b = (1 - use_a) & (i32)(pb <= pc)
+            row[i] = row[i] +% (u8)(c ^ ((a ^ c) & -use_a) ^ ((b ^ c) & -use_b))
+        return true
+    if kind == 3:
+        for i in first..<end:
+            row[i] = row[i] +% (row[i - bpp] >> 1)
+    elif kind == 4:
+        for i in first..<end:
+            row[i] = row[i] +% row[i - bpp]
+    return true
+
+## A residual's cost: its magnitude read as a signed byte.
+inline func cost(residual: i32) -> u32:
+    let d = (u32)residual & 255
+    return d if d < 128 else 256 - d
+
+## Filter the `length` bytes of `row` into `out`: the filter type, then the
+## residuals. `mode` -1 picks per row, 0..4 fixes the filter; `above` is none for
+## a band's first row, which then uses None or Sub only.
+func filter_row(row: const u8*, above: const u8*?, length: usize, bpp: usize, mode: i32, out: u8*):
+    let lead = bpp if bpp < length else length
+    var kind: i32 = mode
+    if mode < 0:
+        # Sums of every filter's residuals in one pass.
+        var sums: u32[5]
+        if let up = above:
+            for i in 0..<lead:
+                let x = (i32)row[i]
+                let b = (i32)up[i]
+                sums[0] += cost(x)
+                sums[1] += cost(x)
+                sums[2] += cost(x - b)
+                sums[3] += cost(x - (b >> 1))
+                sums[4] += cost(x - b)
+            # Written out (the compiler does not inline): each residual's cost is
+            # its magnitude as a signed byte, 128 - |128 - d| for d = r & 255.
+            var s0: u32 = 0
+            var s1: u32 = 0
+            var s2: u32 = 0
+            var s3: u32 = 0
+            var s4: u32 = 0
+            for i in lead..<length:
+                let x = (i32)row[i]
+                let a = (i32)row[i - bpp]
+                let b = (i32)up[i]
+                let c = (i32)up[i - bpp]
+                let db = b - c
+                let da = a - c
+                let pa = (db ^ (db >> 31)) - (db >> 31)
+                let pb = (da ^ (da >> 31)) - (da >> 31)
+                let dc = da + db
+                let pc = (dc ^ (dc >> 31)) - (dc >> 31)
+                let use_a = (i32)(pa <= pb) & (i32)(pa <= pc)
+                let use_b = (1 - use_a) & (i32)(pb <= pc)
+                let p = c ^ ((a ^ c) & -use_a) ^ ((b ^ c) & -use_b)
+                let t0 = 128 - (x & 255)
+                let r0 = 128 - ((t0 ^ (t0 >> 31)) - (t0 >> 31))
+                let t1 = 128 - ((x - a) & 255)
+                let r1 = 128 - ((t1 ^ (t1 >> 31)) - (t1 >> 31))
+                let t2 = 128 - ((x - b) & 255)
+                let r2 = 128 - ((t2 ^ (t2 >> 31)) - (t2 >> 31))
+                let t3 = 128 - ((x - ((a + b) >> 1)) & 255)
+                let r3 = 128 - ((t3 ^ (t3 >> 31)) - (t3 >> 31))
+                let t4 = 128 - ((x - p) & 255)
+                let r4 = 128 - ((t4 ^ (t4 >> 31)) - (t4 >> 31))
+                s0 += (u32)r0
+                s1 += (u32)r1
+                s2 += (u32)r2
+                s3 += (u32)r3
+                s4 += (u32)r4
+            sums[0] += s0
+            sums[1] += s1
+            sums[2] += s2
+            sums[3] += s3
+            sums[4] += s4
+            kind = 0
+            for k in 1..<(usize)5:
+                if sums[k] < sums[(usize)kind]:
+                    kind = (i32)k
+        else:
+            for i in 0..<length:
+                sums[0] += cost((i32)row[i])
+                sums[1] += cost((i32)row[i] - ((i32)row[i - bpp] if i >= bpp else 0))
+            kind = 1 if sums[1] < sums[0] else 0
+    elif above == none and mode > 1:
+        kind = 1
+    out[0] = (u8)kind
+    let o = out + 1
+    if kind == 0:
+        memory.copy(u8[](o, length), u8[]((u8*)row, length), length)
+        return
+    if kind == 1:
+        for i in 0..<lead:
+            o[i] = row[i]
+        for i in lead..<length:
+            o[i] = row[i] -% row[i - bpp]
+        return
+    let up = above else trap("filter needs the row above")
+    if kind == 2:
+        for i in 0..<length:
+            o[i] = row[i] -% up[i]
+    elif kind == 3:
+        for i in 0..<lead:
+            o[i] = row[i] -% (up[i] >> 1)
+        for i in lead..<length:
+            o[i] = row[i] -% (u8)(((u32)row[i - bpp] + (u32)up[i]) >> 1)
+    else:
+        for i in 0..<lead:
+            o[i] = row[i] -% up[i]
+        for i in lead..<length:
+            let a = (i32)row[i - bpp]
+            let b = (i32)up[i]
+            let c = (i32)up[i - bpp]
+            let db = b - c
+            let da = a - c
+            let pa = (db ^ (db >> 31)) - (db >> 31)
+            let pb = (da ^ (da >> 31)) - (da >> 31)
+            let dc = da + db
+            let pc = (dc ^ (dc >> 31)) - (dc >> 31)
+            let use_a = (i32)(pa <= pb) & (i32)(pa <= pc)
+            let use_b = (1 - use_a) & (i32)(pb <= pc)
+            o[i] = row[i] -% (u8)(c ^ ((a ^ c) & -use_a) ^ ((b ^ c) & -use_b))

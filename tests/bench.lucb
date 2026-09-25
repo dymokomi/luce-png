@@ -1,0 +1,60 @@
+## Times PNG decoding and encoding: `bench <file.png> <out.png> [repeats] [level]
+## [raster] [threads]`. Decodes to RGBA8 (or a Raster), then encodes that; the
+## last encoding is written out.
+import files
+import c
+import time
+import memory
+import strings
+import png
+from raster import Raster
+from binary import Buffer
+
+func number(arguments: str[], index: usize, fallback: u64) -> u64:
+    if arguments.length <= index:
+        return fallback
+    return strings.parse_u64(arguments[index]) else fallback
+
+pub func main(arguments: str[]) -> i32!:
+    let encoded = try files.read((c.str)arguments[1])
+    let repeats = (usize)number(arguments, 3, 1)
+    let level = (i32)number(arguments, 4, 6)
+    let raster_mode = arguments.length > 5 and arguments[5] == "raster"
+    let threads = (usize)number(arguments, 6, 0)
+    let info = try png.info(encoded)
+    let pixels = try alloc u8[info.width * info.height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    var raster = Raster()
+    var best: u64 = 0
+    for r in 0..<repeats:
+        let start = time.now()
+        if raster_mode:
+            if r > 0:
+                var kept: u8[]
+                raster.encoded = kept
+                raster.close()
+                raster = Raster()
+            raster.encoded = encoded
+            try png.probe(&raster)
+            try raster.allocate()
+            try png.decode(&raster)
+        else:
+            try png.decode_rgba8(encoded, pixels, png.DecodeOptions(threads = threads))
+        let spent = time.since(start)
+        best = spent if r == 0 or spent < best else best
+    print(f"{info.width}x{info.height} {"raster" if raster_mode else "rgba8"} decode: best {best // 1000000}.{(best // 100000) % 10} ms")
+    var out = Buffer()
+    defer out.close()
+    best = 0
+    for r in 0..<repeats:
+        out.used = 0
+        let start = time.now()
+        if raster_mode:
+            try png.encode(&raster, &out, png.EncodeOptions(level = level, threads = threads))
+        else:
+            try png.encode_rgba8(pixels, info.width, info.height, &out, png.EncodeOptions(level = level, threads = threads))
+        let spent = time.since(start)
+        best = spent if r == 0 or spent < best else best
+    try files.write((c.str)arguments[2], out.view())
+    print(f"encode level {level}: best {best // 1000000}.{(best // 100000) % 10} ms, {out.used} bytes")
+    return 0

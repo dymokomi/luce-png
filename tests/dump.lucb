@@ -1,0 +1,25 @@
+## Decodes one PNG through the Raster API and writes its samples: `dump <in.png>
+## <out.raw>`, a 12-byte header (width, height, channels as little-endian u32) then
+## each sample as a little-endian u16.
+import files
+import c
+import png
+from raster import Raster
+from binary import Buffer
+
+pub func main(arguments: str[]) -> i32!:
+    var raster = Raster()
+    defer raster.close()
+    raster.encoded = try files.read((c.str)arguments[1])
+    try png.probe(&raster)
+    try raster.allocate()
+    try png.decode(&raster)
+    var raw = Buffer()
+    defer raw.close()
+    try raw.uint((u64)raster.width, 4)
+    try raw.uint((u64)raster.height, 4)
+    try raw.uint((u64)raster.channels.length, 4)
+    for value in raster.pixels:
+        try raw.uint((u64)value, 2)
+    try files.write((c.str)arguments[2], raw.view())
+    return 0

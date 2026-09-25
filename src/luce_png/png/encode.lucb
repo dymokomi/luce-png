@@ -1,0 +1,258 @@
+#==============================================================================================
+#
+#   png/encode - The Encoder: bands, chunks and the zlib stream around them
+#
+#   DESCRIPTION:
+#       Rows gather into groups of bands (about a megabyte of pixels a band). Each band
+#       filters and deflates on a worker as an independent segment and becomes one IDAT
+#       chunk; the calling thread appends the chunks in order and folds the bands'
+#       Adler-32s together. The stream is: an IDAT with the zlib header, one IDAT a
+#       band, an IDAT with the Adler-32, then `luPD` recording the band layout.
+#
+#==============================================================================================
+
+## One band's compressed IDAT data and checksums.
+struct BandOut:
+    var data: u8[]
+    var used: usize
+    var adler: u32
+    var crc: u32
+    var failed: bool
+
+## A PNG being written row by row: `begin`, `write_rows` (8-bit formats) or
+## `write_rows16` (16-bit) as often as needed, `finish`, and `close` in any case.
+pub struct Encoder:
+    var width: usize
+    var height: usize
+    var channels: usize
+    var deep: bool
+    ## Bytes a pixel and a row, as PNG stores them (16-bit samples big-endian).
+    var bpp: usize
+    var row_bytes: usize
+    var level: i32
+    var filter: i32
+    var threads: usize
+    var band_rows: usize
+    var bands: usize
+    ## Bands a group, the group's rows and how many are in it.
+    var group: usize
+    var rows: u8[]
+    var buffered: usize
+    var received: usize
+    var next_band: usize
+    var outs: BandOut[]
+    var output: Buffer*
+    var adler: u32
+    var finished: bool
+
+    ## Start a `width` x `height` PNG of `pixels` rows at the end of `output`.
+    pub static func begin(width: usize, height: usize, pixels: Format, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> Encoder!:
+        if width == 0 or height == 0 or width > 1000000 or height > 1000000:
+            error(invalid, "invalid dimensions or channel count")
+        if options.level < 0 or options.level > 9 or options.filter < -1 or options.filter > 4:
+            error(invalid, "PNG level must be 0..9 and filter -1..4")
+        let channels: usize[8] = [1, 2, 3, 4, 1, 2, 3, 4]
+        let index = format_index(pixels)
+        let deep = index >= 4
+        let nc = channels[index]
+        let bpp = nc * (2 if deep else 1)
+        var e = Encoder(width = width, height = height, channels = nc, deep = deep, bpp = bpp, row_bytes = width * bpp, level = options.level, filter = options.filter, threads = worker_count(options.threads, width * height), output = output, adler = 1)
+        # About a megabyte of pixels a band, for balance and for the decoder.
+        e.band_rows = options.band_rows if options.band_rows > 0 else (1048576 + e.row_bytes - 1) // e.row_bytes
+        e.band_rows = e.band_rows if e.band_rows < height else height
+        e.bands = (height + e.band_rows - 1) // e.band_rows
+        let wanted = e.threads * 2
+        e.group = wanted if wanted < e.bands else e.bands
+        e.outs = try new BandOut[e.group] in memory.heap
+        # Signature, header, and the zlib header as an IDAT of its own.
+        var header: u8[13]
+        put32(&header[0], (u32)width)
+        put32(&header[4], (u32)height)
+        header[8] = 16 if deep else 8
+        let colors: u8[4] = [0, 4, 2, 6]
+        header[9] = colors[nc - 1]
+        try output.put(signature)
+        try chunk(output, "IHDR", header)
+        let zlib = flate.zlib_header(options.level)
+        try chunk(output, "IDAT", zlib)
+        return e
+
+    ## Push `count` rows of 8-bit pixels, tightly packed.
+    pub mutating func write_rows(pixels: const u8[], count: usize) -> !:
+        if self.deep:
+            error(invalid, "16-bit PNG rows go through write_rows16")
+        try self.push(pixels, count, false)
+
+    ## Push `count` rows of 16-bit samples, tightly packed.
+    pub mutating func write_rows16(pixels: const u16[], count: usize) -> !:
+        if not self.deep:
+            error(invalid, "8-bit PNG rows go through write_rows")
+        if pixels.length < count * self.width * self.channels:
+            error(invalid, "PNG rows are shorter than the width")
+        try self.push(u8[]((u8*)pixels.data, pixels.length * 2), count, true)
+
+    mutating func push(pixels: const u8[], count: usize, swap: bool) -> !:
+        if self.finished or self.received + count > self.height:
+            error(invalid, "more PNG rows than the picture has")
+        if pixels.length < count * self.row_bytes:
+            error(invalid, "PNG rows are shorter than the width")
+        let group_rows = self.group * self.band_rows
+        var taken: usize = 0
+        while taken < count:
+            if self.buffered == 0 and not swap:
+                # Whole groups, or the rest of the picture, straight from the caller.
+                let left = count - taken
+                var bands: usize = 0
+                if self.received + left == self.height:
+                    bands = self.bands - self.next_band
+                elif left >= group_rows:
+                    bands = left // group_rows * self.group
+                if bands > 0:
+                    try self.encode_bands(pixels.data + taken * self.row_bytes, bands)
+                    let used = left if self.received + left == self.height else bands * self.band_rows
+                    taken += used
+                    self.received += used
+                    continue
+            if self.rows.length == 0:
+                self.rows = try alloc u8[group_rows * self.row_bytes] in memory.heap
+            let rows = group_rows - self.buffered if group_rows - self.buffered < count - taken else count - taken
+            let to = self.rows.data + self.buffered * self.row_bytes
+            let source = pixels.data + taken * self.row_bytes
+            let n = rows * self.row_bytes
+            if swap:
+                # 16-bit samples into PNG's big-endian order.
+                var i: usize = 0
+                while i < n:
+                    to[i] = source[i + 1]
+                    to[i + 1] = source[i]
+                    i += 2
+            else:
+                memory.copy(u8[](to, n), u8[]((u8*)source, n), n)
+            self.buffered += rows
+            self.received += rows
+            taken += rows
+            if self.buffered == group_rows or self.received == self.height:
+                let bands = self.group if self.received < self.height else self.bands - self.next_band
+                try self.encode_bands(self.rows.data, bands)
+                self.buffered = 0
+
+    ## Filter and deflate `count` bands whose first row is at `source`, and append them.
+    mutating func encode_bands(source: const u8*, count: usize) -> !:
+        var done: usize = 0
+        while done < count:
+            let n = self.group if done + self.group <= count else count - done
+            var job = EncodeJob(encoder = &self, source = source + done * self.band_rows * self.row_bytes, first_band = self.next_band)
+            try run_tasks(encode_task, (void*)&job, n, self.threads)
+            for i in 0..<n:
+                let out = &self.outs[i]
+                if out.failed:
+                    error(memory.exhausted, "PNG band buffers could not be allocated")
+                let band = self.next_band + i
+                let rows = self.band_rows if (band + 1) * self.band_rows <= self.height else self.height - band * self.band_rows
+                try self.output.reserve(out.used + 12)
+                var length: u8[4]
+                put32(&length[0], (u32)out.used)
+                try self.output.put(length)
+                try self.output.put(b"IDAT")
+                try self.output.put(out.data[..<out.used])
+                var crc: u8[4]
+                put32(&crc[0], out.crc)
+                try self.output.put(crc)
+                self.adler = out.adler if band == 0 else flate.adler32_combine(self.adler, out.adler, rows * (self.row_bytes + 1))
+            self.next_band += n
+            done += n
+
+    ## Complete the file once every row is in.
+    pub mutating func finish() -> !:
+        if self.finished:
+            return
+        if self.received != self.height:
+            error(invalid, "PNG rows missing at finish")
+        var adler: u8[4]
+        put32(&adler[0], self.adler)
+        try chunk(self.output, "IDAT", adler)
+        if self.bands > 1:
+            var layout: u8[9]
+            layout[0] = 1
+            put32(&layout[1], (u32)self.band_rows)
+            put32(&layout[5], (u32)self.bands)
+            try chunk(self.output, "luPD", layout)
+        try chunk(self.output, "IEND", b"")
+        self.finished = true
+
+    pub mutating func close():
+        for i in 0..<self.outs.length:
+            if self.outs[i].data.length > 0:
+                free(self.outs[i].data) in memory.heap
+        if self.outs.length > 0:
+            free(self.outs) in memory.heap
+        if self.rows.length > 0:
+            free(self.rows) in memory.heap
+        var no_outs: BandOut[]
+        self.outs = no_outs
+        var no_rows: u8[]
+        self.rows = no_rows
+
+struct EncodeJob:
+    var encoder: Encoder*
+    var source: const u8*
+    var first_band: usize
+
+func encode_task(context: void*, index: usize):
+    let job = (EncodeJob*)context
+    let e = job.encoder
+    let band = job.first_band + index
+    let out = &e.outs[index]
+    let first = band * e.band_rows
+    let rows = e.band_rows if first + e.band_rows <= e.height else e.height - first
+    let stride = e.row_bytes + 1
+    let raw = alloc u8[rows * stride] in memory.heap catch:
+        out.failed = true
+        return
+    defer free(raw) in memory.heap
+    let source = job.source + index * e.band_rows * e.row_bytes
+    for r in 0..<rows:
+        let above: const u8*? = none if r == 0 else source + (r - 1) * e.row_bytes
+        filter_row(source + r * e.row_bytes, above, e.row_bytes, e.bpp, e.filter, raw.data + r * stride)
+    out.adler = flate.adler32(raw)
+    let bound = flate.deflate_bound(raw.length)
+    if out.data.length < bound:
+        if out.data.length > 0:
+            free(out.data) in memory.heap
+        out.data = alloc u8[bound] in memory.heap catch:
+            out.failed = true
+            return
+    out.used = flate.deflate_raw(raw, e.level, out.data, band + 1 == e.bands) catch:
+        out.failed = true
+        return
+    out.crc = flate.crc32(out.data[..<out.used], flate.crc32(b"IDAT"))
+    out.failed = false
+
+func format_index(kind: Format) -> usize:
+    match kind:
+        .gray8: return 0
+        .gray_alpha8: return 1
+        .rgb8: return 2
+        .rgba8: return 3
+        .gray16: return 4
+        .gray_alpha16: return 5
+        .rgb16: return 6
+        .rgba16: return 7
+
+func put32(at: u8*, value: u32):
+    at[0] = (u8)(value >> 24)
+    at[1] = (u8)(value >> 16)
+    at[2] = (u8)(value >> 8)
+    at[3] = (u8)value
+
+## Append a chunk: length, type, data and CRC.
+func chunk(output: Buffer*, name: str, data: const u8[]) -> !:
+    var length: u8[4]
+    put32(&length[0], (u32)data.length)
+    try output.put(length)
+    let start = output.used
+    try output.text(name)
+    try output.put(data)
+    var crc: u8[4]
+    put32(&crc[0], flate.crc32(output.view()[start..]))
+    try output.put(crc)

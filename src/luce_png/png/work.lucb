@@ -1,0 +1,50 @@
+#==============================================================================================
+#
+#   png/work - The worker threads
+#
+#==============================================================================================
+
+struct Pool:
+    var next: @usize
+    var count: usize
+    var task: func(void*, usize) -> unit
+    var context: void*
+
+func pool_worker(context: void*?):
+    drain((Pool*)(context else return))
+
+func drain(pool: Pool*):
+    while true:
+        let index = pool.next.add(1)
+        if index >= pool.count:
+            return
+        pool.task(pool.context, index)
+
+## Run `task(context, i)` for i in 0..<`count` on up to `threads` threads, the
+## caller's included; fewer if threads cannot start.
+func run_tasks(task: func(void*, usize) -> unit, context: void*, count: usize, threads: usize) -> !:
+    if count == 0:
+        return
+    var pool = Pool(count = count, task = task, context = context)
+    var workers = threads if threads < count else count
+    workers = 64 if workers > 64 else workers
+    var handles: thread.Handle[64]
+    var started: usize = 0
+    for i in 1..<workers:
+        handles[started] = thread.spawn(pool_worker, (void*)&pool, name = "png") catch:
+            break
+        started += 1
+    drain(&pool)
+    var failed = false
+    for i in 0..<started:
+        handles[i].join() catch:
+            failed = true
+    if failed:
+        error(invalid, "PNG worker thread could not be joined")
+
+## Threads for a picture: `requested`, or every processor for 0; one when small.
+func worker_count(requested: usize, pixels: usize) -> usize:
+    if pixels < 65536:
+        return 1
+    let wanted = (usize)os.cpus() if requested == 0 else requested
+    return 1 if wanted == 0 else 64 if wanted > 64 else wanted

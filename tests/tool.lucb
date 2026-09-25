@@ -1,0 +1,103 @@
+## The gate's driver.
+## `tool decode <in.png> <out.raw> <rgba8|rgba16|rows8|rows16> [threads]` writes a
+## 12-byte header (width, height, bytes a pixel) and the pixels (16-bit samples
+## little-endian).
+## `tool encode <in.png> <out.png> <level> <filter> <gray8|ga8|rgb8|rgba8|gray16|ga16|rgb16|rgba16>
+## <whole|stream> [threads] [band rows]` encodes the input's pixels in that format.
+import files
+import c
+import memory
+import strings
+import png
+from binary import Buffer
+
+struct Collected:
+    var out: Buffer*
+    var next_row: usize
+    var failed: bool
+
+func collect(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !:
+    let collected = (Collected*)(context else return)
+    if first != collected.next_row:
+        collected.failed = true
+    collected.next_row = first + rows
+    try collected.out.put(bytes)
+
+func number(arguments: str[], index: usize, fallback: u64) -> u64:
+    if arguments.length <= index:
+        return fallback
+    return strings.parse_u64(arguments[index]) else fallback
+
+pub func main(arguments: str[]) -> i32!:
+    let data = try files.read((c.str)arguments[2])
+    let info = try png.info(data)
+    let w = info.width
+    let h = info.height
+    if arguments[1] == "decode":
+        let mode = arguments[4]
+        let options = png.DecodeOptions(threads = (usize)number(arguments, 5, 0))
+        let deep = mode == "rgba16" or mode == "rows16"
+        var raw = Buffer()
+        defer raw.close()
+        try raw.uint((u64)w, 4)
+        try raw.uint((u64)h, 4)
+        try raw.uint(8 if deep else 4, 4)
+        if mode == "rows8" or mode == "rows16":
+            var collected = Collected(out = &raw, next_row = 0, failed = false)
+            try png.decode_rows(data, collect, (void*)&collected, deep = deep, options = options)
+            if collected.failed or collected.next_row != h:
+                print("rows out of order or missing")
+                return 1
+        elif deep:
+            let out = try alloc u16[w * h * 4] in memory.heap
+            try png.decode_rgba16(data, out, options)
+            try raw.put(u8[]((u8*)out.data, out.length * 2))
+        else:
+            let out = try alloc u8[w * h * 4] in memory.heap
+            try png.decode_rgba8(data, out, options)
+            try raw.put(out)
+        try files.write((c.str)arguments[3], raw.view())
+        return 0
+    # Encode: the input as 16-bit RGBA, then in the asked format.
+    let level = (i32)number(arguments, 4, 6)
+    let filter = (i32)(strings.parse_i64(arguments[5]) else -1)
+    let kind = arguments[6]
+    let stream = arguments[7] == "stream"
+    let threads = (usize)number(arguments, 8, 0)
+    let band_rows = (usize)number(arguments, 9, 0)
+    let rgba = try alloc u16[w * h * 4] in memory.heap
+    try png.decode_rgba16(data, rgba)
+    let names: str[8] = ["gray8", "ga8", "rgb8", "rgba8", "gray16", "ga16", "rgb16", "rgba16"]
+    let formats: png.Format[8] = [.gray8, .gray_alpha8, .rgb8, .rgba8, .gray16, .gray_alpha16, .rgb16, .rgba16]
+    var index: usize = 3
+    for i in 0..<(usize)8:
+        if names[i] == kind:
+            index = i
+    let channels: usize = index % 4 + 1
+    let deep = index >= 4
+    let picks: usize[16] = [0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 2, 0, 0, 1, 2, 3]
+    let bytes = try alloc u8[w * h * channels] in memory.heap
+    let words = try alloc u16[w * h * channels] in memory.heap
+    for p in 0..<w * h:
+        for k in 0..<channels:
+            let v = rgba[p * 4 + picks[(channels - 1) * 4 + k]]
+            words[p * channels + k] = v
+            bytes[p * channels + k] = (u8)(v >> 8)
+    var out = Buffer()
+    defer out.close()
+    let options = png.EncodeOptions(level = level, filter = filter, threads = threads, band_rows = band_rows)
+    var encoder = try png.Encoder.begin(w, h, formats[index], &out, options)
+    defer encoder.close()
+    let step: usize = 7 if stream else h
+    var y: usize = 0
+    while y < h:
+        let rows = step if y + step <= h else h - y
+        let row = w * channels
+        if deep:
+            try encoder.write_rows16(words[y * row..<(y + rows) * row], rows)
+        else:
+            try encoder.write_rows(bytes[y * row..<(y + rows) * row], rows)
+        y += rows
+    try encoder.finish()
+    try files.write((c.str)arguments[3], out.view())
+    return 0

@@ -1,0 +1,100 @@
+#==============================================================================================
+#
+#   png/tests - The module's tests
+#
+#==============================================================================================
+
+test "an RGBA round trip is exact":
+    var pixels: u8[4000]
+    for i in 0..<pixels.length:
+        pixels[i] = (u8)((i * 7 + i // 40) % 256)
+    var out = Buffer()
+    defer out.close()
+    try encode_rgba8(pixels, 25, 40, &out)
+    var back: u8[4000]
+    try decode_rgba8(out.view(), back)
+    for i in 0..<pixels.length:
+        assert(back[i] == pixels[i])
+
+test "16-bit samples, streamed rows and the Raster route round-trip":
+    var words: u16[1200]
+    for i in 0..<words.length:
+        words[i] = (u16)((i * 2654435761) >> 7)
+    var out = Buffer()
+    defer out.close()
+    var encoder = try Encoder.begin(20, 15, .rgba16, &out, EncodeOptions(level = 9, band_rows = 4))
+    defer encoder.close()
+    var y: usize = 0
+    while y < 15:
+        let rows: usize = 4 if y + 4 <= 15 else 15 - y
+        try encoder.write_rows16(words[y * 80..<(y + rows) * 80], rows)
+        y += rows
+    try encoder.finish()
+    let found = try info(out.view())
+    assert(found.width == 20 and found.height == 15 and found.bits == 16 and found.color == 6 and found.alpha)
+    var back: u16[1200]
+    try decode_rgba16(out.view(), back)
+    for i in 0..<words.length:
+        assert(back[i] == words[i])
+    # The same picture as a Raster: its samples come back as they went in.
+    var raster = Raster()
+    defer raster.close()
+    raster.encoded = out.data[..<out.used]
+    try probe(&raster)
+    try raster.allocate()
+    try decode(&raster)
+    for i in 0..<words.length:
+        assert(raster.pixels[i] == (f64)words[i])
+    var again = Buffer()
+    defer again.close()
+    try encode(&raster, &again, EncodeOptions(filter = 4))
+    var empty: u8[]
+    raster.encoded = empty
+    var third: u16[1200]
+    try decode_rgba16(again.view(), third)
+    for i in 0..<words.length:
+        assert(third[i] == words[i])
+
+test "gray formats expand to RGBA":
+    var gray: u8[18]
+    for i in 0..<gray.length:
+        gray[i] = (u8)(i * 14)
+    var out = Buffer()
+    defer out.close()
+    var encoder = try Encoder.begin(3, 3, .gray_alpha8, &out)
+    defer encoder.close()
+    try encoder.write_rows(gray, 3)
+    try encoder.finish()
+    var back: u8[36]
+    try decode_rgba8(out.view(), back)
+    for p in 0..<(usize)9:
+        assert(back[p * 4] == gray[p * 2] and back[p * 4 + 1] == gray[p * 2] and back[p * 4 + 2] == gray[p * 2] and back[p * 4 + 3] == gray[p * 2 + 1])
+
+test "the encoder refuses bad requests":
+    var out = Buffer()
+    defer out.close()
+    var pixels: u8[64]
+    var refused = false
+    encode_rgba8(pixels, 4, 4, &out, EncodeOptions(level = 10)) catch failure:
+        refused = failure.code == invalid
+        recover ()
+    assert(refused)
+    var encoder = try Encoder.begin(4, 4, .rgba8, &out)
+    defer encoder.close()
+    try encoder.write_rows(pixels[..<32], 2)
+    refused = false
+    encoder.finish() catch failure:
+        refused = failure.code == invalid
+        recover ()
+    assert(refused)
+    refused = false
+    encoder.write_rows(pixels, 4) catch failure:
+        refused = failure.code == invalid
+        recover ()
+    assert(refused)
+    refused = false
+    var words: u16[4]
+    encoder.write_rows16(words, 1) catch failure:
+        refused = failure.code == invalid
+        recover ()
+    assert(refused)

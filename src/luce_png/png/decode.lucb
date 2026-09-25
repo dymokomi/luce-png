@@ -1,0 +1,525 @@
+#==============================================================================================
+#
+#   png/decode - Parallel and sequential decoding, Adam7 and output conversion
+#
+#   DESCRIPTION:
+#       A PNG with this encoder's `luPD` chunk decodes band by band on every processor:
+#       each band's IDAT chunk inflates, unfilters and converts into the output on its
+#       own, and the bands' Adler-32s combine into the stream's. Any inconsistency sends
+#       the file down the general path instead.
+#
+#       The general path inflates the whole stream on the calling thread while a second
+#       thread checksums, unfilters and converts each row as soon as it is complete.
+#       Interlaced pictures and row callbacks inflate first and then work row by row.
+#
+#==============================================================================================
+
+## Where decoded rows go: RGBA8 bytes, RGBA16 samples, a Raster's f64 samples, or a
+## row sink fed from a buffer of whole bands.
+struct Target:
+    var bytes: u8[]
+    var words: u16[]
+    var doubles: f64[]
+    ## A Raster's channels.
+    var channels: usize
+    var sink: RowSink?
+    var context: void*?
+    var deep: bool
+    ## The picture row stored at the start of `bytes` (row sinks).
+    var first_row: usize
+
+## The Adam7 passes: first column and row, and steps.
+let xstart: usize[7] = [0, 4, 0, 2, 0, 1, 0]
+let ystart: usize[7] = [0, 0, 4, 0, 2, 0, 1]
+let xstep: usize[7] = [8, 8, 4, 4, 2, 2, 1]
+let ystep: usize[7] = [8, 8, 8, 4, 4, 2, 2]
+
+func extent(size: usize, start: usize, step: usize) -> usize:
+    return (size - start + step - 1) // step if size > start else 0
+
+## The picture's layout for conversion.
+struct Layout:
+    var width: usize
+    var height: usize
+    var bits: usize
+    var color: usize
+    var channels: usize
+    ## Bytes a pixel (at least one) and a row of `width` pixels.
+    var bpp: usize
+    var palette: const u8[]
+    var transparency: const u8[]
+
+    static func of(p: const Parsed*) -> Layout:
+        let nc = source_channels(p.info.color)
+        return Layout(width = p.info.width, height = p.info.height, bits = p.info.bits, color = p.info.color, channels = nc, bpp = (nc * p.info.bits + 7) // 8, palette = p.palette, transparency = p.transparency)
+
+    ## Bytes of a row of `w` pixels.
+    func row_bytes(w: usize) -> usize:
+        return (w * self.channels * self.bits + 7) // 8
+
+## Sample `index` of an unfiltered row.
+inline func sample(row: const u8*, index: usize, bits: usize) -> u32:
+    if bits == 16:
+        return ((u32)row[index * 2] << 8) | (u32)row[index * 2 + 1]
+    if bits == 8:
+        return (u32)row[index]
+    return ((u32)row[index * bits // 8] >> (u32)(8 - bits - (index * bits % 8))) & (((u32)1 << (u32)bits) - 1)
+
+## Convert the unfiltered row `row` of `w` pixels into picture row `y` of the
+## target, pixel x landing in column xs + x * dx. False for a palette index out of
+## range.
+func convert_row(l: const Layout*, row: const u8*, w: usize, y: usize, xs: usize, dx: usize, target: const Target*) -> bool:
+    let width = l.width
+    if target.bytes.length > 0 or target.sink != none:
+        let deep = target.deep and target.sink != none
+        if deep:
+            let out = (u16*)(target.bytes.data + (y - target.first_row) * width * 8)
+            return convert_deep(l, row, w, xs, dx, out)
+        let out = target.bytes.data + (y - target.first_row) * width * 4
+        # The common layouts straight through.
+        if l.bits == 8 and dx == 1 and l.transparency.length == 0:
+            if l.color == 6:
+                memory.copy(u8[](out, w * 4), u8[]((u8*)row, w * 4), w * 4)
+                return true
+            if l.color == 2:
+                for x in 0..<w:
+                    out[x * 4] = row[x * 3]
+                    out[x * 4 + 1] = row[x * 3 + 1]
+                    out[x * 4 + 2] = row[x * 3 + 2]
+                    out[x * 4 + 3] = 255
+                return true
+        var rgba: u32[4]
+        for x in 0..<w:
+            if not pixel_rgba(l, row, x, &rgba[0]):
+                return false
+            let at = out + (xs + x * dx) * 4
+            for c in 0..<(usize)4:
+                at[c] = (u8)((rgba[c] * 255 + 32767) // 65535)
+        return true
+    if target.words.length > 0:
+        return convert_deep(l, row, w, xs, dx, target.words.data + y * width * 4)
+    # A Raster: the samples as integers of the file's depth (low depths scaled to
+    # 0..255), a palette as its RGB, tRNS as an alpha channel.
+    let nc = target.channels
+    let base = target.doubles.data + y * width * nc
+    for x in 0..<w:
+        let at = base + (xs + x * dx) * nc
+        if l.color == 3:
+            let index = (usize)sample(row, x, l.bits)
+            if index >= l.palette.length // 3:
+                return false
+            for c in 0..<(usize)3:
+                at[c] = (f64)l.palette[index * 3 + c]
+            if nc == 4:
+                at[3] = (f64)l.transparency[index] if index < l.transparency.length else 255.0
+            continue
+        var transparent = l.transparency.length > 0
+        for c in 0..<l.channels:
+            let value = sample(row, x * l.channels + c, l.bits)
+            at[c] = (f64)value * 255.0 / (f64)(((u32)1 << (u32)l.bits) - 1) if l.bits < 8 else (f64)value
+            if transparent:
+                let key = ((u32)l.transparency[c * 2] << 8) | (u32)l.transparency[c * 2 + 1]
+                transparent = value == key
+        if l.transparency.length > 0:
+            at[l.channels] = 0.0 if transparent else 65535.0 if l.bits == 16 else 255.0
+    return true
+
+## A row to 16-bit RGBA at `out` (a picture row).
+func convert_deep(l: const Layout*, row: const u8*, w: usize, xs: usize, dx: usize, out: u16*) -> bool:
+    var rgba: u32[4]
+    for x in 0..<w:
+        if not pixel_rgba(l, row, x, &rgba[0]):
+            return false
+        let at = out + (xs + x * dx) * 4
+        for c in 0..<(usize)4:
+            at[c] = (u16)rgba[c]
+    return true
+
+## Pixel `x` of an unfiltered row as 16-bit RGBA.
+func pixel_rgba(l: const Layout*, row: const u8*, x: usize, rgba: u32*) -> bool:
+    let bits = l.bits
+    let top = ((u32)1 << (u32)bits) - 1
+    if l.color == 3:
+        let index = (usize)sample(row, x, bits)
+        if index >= l.palette.length // 3:
+            return false
+        for c in 0..<(usize)3:
+            rgba[c] = (u32)l.palette[index * 3 + c] * 257
+        rgba[3] = (u32)l.transparency[index] * 257 if index < l.transparency.length else 65535
+        return true
+    let nc = l.channels
+    var raw: u32[4]
+    for c in 0..<nc:
+        raw[c] = sample(row, x * nc + c, bits)
+    # Scale to 16 bits: exact for every depth (65535 is a multiple of 2^k - 1).
+    let scale = 65535 // top
+    let gray = l.color == 0 or l.color == 4
+    rgba[0] = raw[0] * scale
+    rgba[1] = raw[0] * scale if gray else raw[1] * scale
+    rgba[2] = raw[0] * scale if gray else raw[2] * scale
+    rgba[3] = raw[1] * scale if l.color == 4 else raw[3] * scale if l.color == 6 else 65535
+    if l.transparency.length > 0:
+        var same = true
+        for c in 0..<nc:
+            let key = ((u32)l.transparency[c * 2] << 8) | (u32)l.transparency[c * 2 + 1]
+            same = same and raw[c] == key
+        if same:
+            rgba[3] = 0
+    return true
+
+## Decode `data` into `target`.
+func decode_into(data: const u8[], target: Target*, options: DecodeOptions) -> !:
+    var parsed = try parse(data, false)
+    defer parsed.close()
+    let threads = worker_count(options.threads, parsed.info.width * parsed.info.height)
+    try parsed.check_idat(data, threads)
+    let l = Layout.of(&parsed)
+    if target.doubles.length > 0 and target.channels != (3 if l.color == 3 else l.channels) + (1 if l.transparency.length > 0 else 0):
+        error(invalid, "PNG raster does not match the file")
+    if try parallel_decode(data, &parsed, &l, target, threads, options):
+        return
+    try sequential_decode(data, &parsed, &l, target, threads, options)
+
+## Bytes of scanlines (filter bytes included) the stream inflates to.
+func scanline_bytes(l: const Layout*, interlaced: bool) -> usize:
+    if not interlaced:
+        return (l.row_bytes(l.width) + 1) * l.height
+    var total: usize = 0
+    for pass in 0..<(usize)7:
+        let w = extent(l.width, xstart[pass], xstep[pass])
+        let h = extent(l.height, ystart[pass], ystep[pass])
+        if w > 0 and h > 0:
+            total += (l.row_bytes(w) + 1) * h
+    return total
+
+## One band of a `luPD` file.
+struct BandJob:
+    var data: const u8[]
+    var parsed: const Parsed*
+    var layout: const Layout*
+    var target: const Target*
+    ## The band task 0 decodes (row sinks work a group of bands at a time).
+    var first_band: usize
+    var adlers: u32[]
+    var failed: @u32
+
+func band_task(context: void*, index: usize):
+    let job = (BandJob*)context
+    let band = job.first_band + index
+    let p = job.parsed
+    let l = job.layout
+    let first = band * p.band_rows
+    let rows = p.band_rows if first + p.band_rows <= l.height else l.height - first
+    let stride = l.row_bytes(l.width) + 1
+    let raw = alloc u8[rows * stride] in memory.heap catch:
+        discard(job.failed.swap(1))
+        return
+    defer free(raw) in memory.heap
+    let used = flate.inflate_raw(p.piece(job.data, band + 1), raw) catch:
+        discard(job.failed.swap(1))
+        return
+    if used != p.pieces[band + 1].length:
+        discard(job.failed.swap(1))
+        return
+    job.adlers[band] = flate.adler32(raw)
+    for r in 0..<rows:
+        let row = raw.data + r * stride
+        let kind = row[0]
+        # A band's first row stands alone: None or Sub only.
+        if r == 0 and kind > 1:
+            discard(job.failed.swap(1))
+            return
+        let above: const u8*? = none if r == 0 else raw.data + (r - 1) * stride + 1
+        if not unfilter(kind, row + 1, above, stride - 1, l.bpp):
+            discard(job.failed.swap(1))
+            return
+        if not convert_row(l, row + 1, l.width, first + r, 0, 1, job.target):
+            discard(job.failed.swap(1))
+            return
+
+## Decode a file with a consistent `luPD` chunk band by band on every processor;
+## false, to take the general path, when it has none or the bands do not decode.
+func parallel_decode(data: const u8[], p: const Parsed*, l: const Layout*, target: Target*, threads: usize, options: DecodeOptions) -> bool!:
+    let bands = p.bands
+    if bands < 2 or threads < 2 or p.info.interlaced or p.count != bands + 2 or p.band_rows == 0:
+        return false
+    if p.band_rows * (bands - 1) >= l.height or p.band_rows * bands < l.height:
+        return false
+    if p.pieces[0].length != 2 or p.pieces[bands + 1].length != 4:
+        return false
+    let header = p.piece(data, 0)
+    if (header[0] & 15) != 8 or (((u32)header[0] << 8) | (u32)header[1]) % 31 != 0 or (header[1] & 32) != 0:
+        return false
+    let adlers = try new u32[bands] in memory.heap
+    defer free(adlers) in memory.heap
+    var job = BandJob(data = data, parsed = p, layout = l, target = target, first_band = 0, adlers = adlers)
+    if let deliver = target.sink:
+        # Row callbacks: a few bands a thread at a time into one buffer, handed on.
+        let pixel: usize = 8 if target.deep else 4
+        let per = threads * 2
+        let buffer = try alloc u8[per * p.band_rows * l.width * pixel] in memory.heap
+        defer free(buffer) in memory.heap
+        target.bytes = buffer
+        var band: usize = 0
+        while band < bands:
+            let count = per if band + per <= bands else bands - band
+            job.first_band = band
+            target.first_row = band * p.band_rows
+            try run_tasks(band_task, (void*)&job, count, threads)
+            if job.failed.load() != 0:
+                if band == 0:
+                    return false
+                error(corrupt, "PNG band does not decode")
+            let first = band * p.band_rows
+            let last = first + count * p.band_rows if first + count * p.band_rows < l.height else l.height
+            try deliver(target.context, first, last - first, buffer[..<(last - first) * l.width * pixel])
+            band += count
+    else:
+        try run_tasks(band_task, (void*)&job, bands, threads)
+        if job.failed.load() != 0:
+            return false
+    # The stream's Adler-32 from the bands'.
+    let stride = l.row_bytes(l.width) + 1
+    var adler = adlers[0]
+    for b in 1..<bands:
+        let rows = p.band_rows if (b + 1) * p.band_rows <= l.height else l.height - b * p.band_rows
+        adler = flate.adler32_combine(adler, adlers[b], rows * stride)
+    let tail = p.piece(data, bands + 1)
+    let stored = ((u32)tail[0] << 24) | ((u32)tail[1] << 16) | ((u32)tail[2] << 8) | (u32)tail[3]
+    if stored != adler:
+        if target.sink != none:
+            error(corrupt, "zlib Adler checksum mismatch")
+        return false
+    return true
+
+type Progress = @usize
+
+## What the inflating thread and the row workers share. Rows unfilter out of place
+## (into `clean`, or the output when that is the file's own layout) so the Adler-32
+## can read the inflated bytes behind them; a row follows the row above it chunk by
+## chunk, a wavefront across the workers.
+struct Follow:
+    var raw: u8[]
+    var clean: u8*
+    var direct: bool
+    var layout: const Layout*
+    var target: const Target*
+    var stride: usize
+    var produced: @usize
+    var finished: @u32
+    var next_row: @usize
+    var done: Progress[]
+    var failed: @u32
+    var failure: str
+    var adler: u32
+
+let wave_chunk: usize = 4096
+
+func follow_progress(context: void*?, produced: usize):
+    let f = (Follow*)(context else return)
+    f.produced.store(produced, .release)
+
+## Wait until the inflater has produced `bytes`; false if it stopped short.
+func await_inflated(f: Follow*, bytes: usize) -> bool:
+    while f.produced.load(.acquire) < bytes:
+        if f.finished.load(.acquire) != 0 and f.produced.load(.acquire) < bytes:
+            return false
+        if f.failed.load(.acquire) != 0:
+            return false
+        thread.yield()
+    return true
+
+## A row worker: claim rows in order and unfilter each behind the row above.
+func follow_rows(context: void*?):
+    let f = (Follow*)(context else return)
+    let l = f.layout
+    let length = f.stride - 1
+    while true:
+        let row = f.next_row.add(1)
+        if row >= l.height:
+            return
+        if not await_inflated(f, (row + 1) * f.stride):
+            return
+        let source = f.raw.data + row * f.stride
+        let kind = source[0]
+        let to = f.clean + row * length
+        memory.copy(u8[](to, length), u8[](source + 1, length), length)
+        var x: usize = 0
+        while x < length:
+            let end = x + wave_chunk if x + wave_chunk < length else length
+            if row > 0:
+                while f.done[row - 1].load(.acquire) < end:
+                    if f.failed.load(.acquire) != 0:
+                        return
+                    thread.pause()
+            let above: const u8*? = none if row == 0 else to - length
+            if not unfilter_span(kind, to, above, x, end, l.bpp):
+                f.failure = "invalid PNG row filter"
+                discard(f.failed.swap(1))
+                return
+            f.done[row].store(end, .release)
+            x = end
+        if not f.direct:
+            if not convert_row(l, to, l.width, row, 0, 1, f.target):
+                f.failure = "PNG palette index out of range"
+                discard(f.failed.swap(1))
+                return
+
+## The checksum worker: the Adler-32 of the inflated bytes as they arrive.
+func follow_adler(context: void*?):
+    let f = (Follow*)(context else return)
+    var at: usize = 0
+    var adler: u32 = 1
+    let total = f.raw.length
+    while at < total:
+        let ready = f.produced.load(.acquire)
+        if ready > at:
+            adler = flate.adler32(f.raw[at..<ready], adler)
+            at = ready
+            continue
+        if f.finished.load(.acquire) != 0 and f.produced.load(.acquire) <= at:
+            return
+        if f.failed.load(.acquire) != 0:
+            return
+        thread.yield()
+    f.adler = adler
+
+## Decode through one zlib stream of all IDAT data.
+func sequential_decode(data: const u8[], p: const Parsed*, l: const Layout*, target: Target*, threads: usize, options: DecodeOptions) -> !:
+    # The IDAT data in one piece.
+    var total: usize = 0
+    for i in 0..<p.count:
+        total += p.pieces[i].length
+    if total > options.max_bytes:
+        error(limit, "PNG data exceeds byte limit")
+    let stream = p.piece(data, 0) if p.count == 1 else try join_pieces(data, p, total)
+    defer release_pieces(p, stream)
+    if stream.length < 6 or (stream[0] & 15) != 8 or stream[0] >> 4 > 7 or (((u32)stream[0] << 8) | (u32)stream[1]) % 31 != 0:
+        error(corrupt, "invalid zlib header")
+    if (stream[1] & 32) != 0:
+        error(unsupported, "preset zlib dictionaries are not supported")
+    let expected = scanline_bytes(l, p.info.interlaced)
+    if expected > options.max_bytes:
+        error(invalid, "PNG scanlines exceed byte limit")
+    let raw = try alloc u8[expected] in memory.heap
+    defer free(raw) in memory.heap
+    let stride = l.row_bytes(l.width) + 1
+    let pipelined = threads > 1 and not p.info.interlaced and target.sink == none
+    if pipelined:
+        try pipelined_inflate(stream, raw, l, target, threads)
+        return
+    let used = try flate.inflate_raw(stream[2..], raw)
+    try check_adler(stream, 2 + used, flate.adler32(raw))
+    try rows_in_order(p, l, raw, target)
+
+## Inflate on this thread while workers checksum, unfilter and convert.
+func pipelined_inflate(stream: const u8[], raw: u8[], l: const Layout*, target: const Target*, threads: usize) -> !:
+    let length = l.row_bytes(l.width)
+    # RGBA8 into RGBA8 unfilters straight into the output.
+    let direct = target.bytes.length > 0 and l.bits == 8 and l.color == 6
+    var clean: u8[]
+    if not direct:
+        clean = try alloc u8[l.height * length] in memory.heap
+    defer release(clean)
+    let done = try new Progress[l.height] in memory.heap
+    defer free(done) in memory.heap
+    var f = Follow(raw = raw, clean = target.bytes.data if direct else clean.data, direct = direct, layout = l, target = target, stride = length + 1, done = done, failure = "", adler = 0)
+    # Seven threads keep pace with one inflater; more only contend for the cores.
+    let workers = threads - 1 if threads - 1 < 7 else 7
+    var handles: thread.Handle[17]
+    var started: usize = 0
+    handles[0] = try thread.spawn(follow_adler, (void*)&f, name = "png adler")
+    started = 1
+    for i in 1..<workers:
+        handles[started] = thread.spawn(follow_rows, (void*)&f, name = "png rows") catch:
+            break
+        started += 1
+    let used = flate.inflate_raw(stream[2..], raw, follow_progress, (void*)&f) catch failure:
+        f.finished.store(1, .release)
+        discard(f.failed.swap(1))
+        for i in 0..<started:
+            discard(handles[i].join() else ())
+        error(failure.code, failure.message)
+    f.finished.store(1, .release)
+    # This thread helps with the rows that are left.
+    follow_rows((void*)&f)
+    for i in 0..<started:
+        try handles[i].join()
+    if f.failed.load() != 0:
+        error(corrupt, f.failure)
+    try check_adler(stream, 2 + used, f.adler)
+
+func check_adler(stream: const u8[], at: usize, adler: u32) -> !:
+    if stream.length - at < 4:
+        error(corrupt, "truncated zlib stream")
+    let stored = ((u32)stream[at] << 24) | ((u32)stream[at + 1] << 16) | ((u32)stream[at + 2] << 8) | (u32)stream[at + 3]
+    if stored != adler:
+        error(corrupt, "zlib Adler checksum mismatch")
+
+func join_pieces(data: const u8[], p: const Parsed*, total: usize) -> const u8[]!:
+    let joined = try alloc u8[total] in memory.heap
+    var at: usize = 0
+    for i in 0..<p.count:
+        let piece = p.piece(data, i)
+        memory.copy(joined[at..], piece, piece.length)
+        at += piece.length
+    return joined
+
+func release_pieces(p: const Parsed*, stream: const u8[]):
+    if p.count > 1:
+        free((u8[])stream) in memory.heap
+
+## Unfilter and convert inflated scanlines on this thread, pass by pass, feeding a
+## row sink in groups of rows.
+func rows_in_order(p: const Parsed*, l: const Layout*, raw: u8[], target: Target*) -> !:
+    let interlaced = p.info.interlaced
+    let passes: usize = 7 if interlaced else 1
+    let pixel: usize = 8 if target.deep else 4
+    let group: usize = 64
+    var buffer: u8[]
+    if target.sink != none:
+        # Interlaced rows fill the whole picture before any row is complete.
+        let rows = l.height if interlaced else group
+        buffer = try alloc u8[rows * l.width * pixel] in memory.heap
+        target.bytes = buffer
+        target.first_row = 0
+    var offset: usize = 0
+    for pass in 0..<passes:
+        let xs = xstart[pass] if interlaced else 0
+        let ys = ystart[pass] if interlaced else 0
+        let dx = xstep[pass] if interlaced else 1
+        let dy = ystep[pass] if interlaced else 1
+        let w = extent(l.width, xs, dx)
+        let h = extent(l.height, ys, dy)
+        if w == 0 or h == 0:
+            continue
+        let rowbytes = l.row_bytes(w)
+        for y in 0..<h:
+            let at = raw.data + offset
+            let above: const u8*? = none if y == 0 else at - rowbytes
+            if not unfilter(at[0], at + 1, above, rowbytes, l.bpp):
+                release(buffer)
+                error(corrupt, "invalid PNG row filter")
+            let picture_row = ys + y * dy
+            if not convert_row(l, at + 1, w, picture_row, xs, dx, target):
+                release(buffer)
+                error(corrupt, "PNG palette index out of range")
+            offset += rowbytes + 1
+            if not interlaced:
+                if let deliver = target.sink:
+                    if picture_row + 1 - target.first_row == group or picture_row + 1 == l.height:
+                        let count = picture_row + 1 - target.first_row
+                        deliver(target.context, target.first_row, count, buffer[..<count * l.width * pixel]) catch failure:
+                            release(buffer)
+                            error(failure.code, failure.message)
+                        target.first_row = picture_row + 1
+    if interlaced:
+        if let deliver = target.sink:
+            deliver(target.context, 0, l.height, buffer[..<l.height * l.width * pixel]) catch failure:
+                release(buffer)
+                error(failure.code, failure.message)
+    release(buffer)
+
+func release(buffer: u8[]):
+    if buffer.length > 0:
+        free(buffer) in memory.heap

@@ -1,0 +1,210 @@
+#==============================================================================================
+#
+#   png - PNG decoding and encoding
+#
+#   DESCRIPTION:
+#       Static PNG: every standard colour type and bit depth, palettes, tRNS and Adam7.
+#       Decoding goes to 8-bit or 16-bit RGBA (`decode_rgba8`, `decode_rgba16`), to a
+#       row callback (`decode_rows`), or to a Raster's f64 samples (`probe`, `decode`).
+#       Encoding takes 8- or 16-bit gray, gray-alpha, RGB or RGBA rows at once
+#       (`encode_rgba8`...) or pushed in bands through an `Encoder`, or a Raster.
+#
+#       Encoding filters each row (libpng's minimum-sum heuristic) and deflates bands
+#       of rows on every processor as independent segments, one IDAT chunk each, joined
+#       with sync flushes into one valid zlib stream, as pigz does. A band's first row
+#       is filtered without the row above, and a private ancillary chunk `luPD` records
+#       the bands, so this decoder inflates, unfilters and converts them on every
+#       processor too. Other PNGs inflate on the calling thread while a second thread
+#       unfilters and converts the rows already inflated.
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb    the public API
+#       chunks.lucb    chunk parsing, the header, palette and transparency
+#       filters.lucb   filtering and unfiltering rows
+#       decode.lucb    parallel and sequential decoding, Adam7, output conversion
+#       encode.lucb    the Encoder: bands, chunks and the zlib stream around them
+#       work.lucb      the worker threads
+#       tests.lucb     the module's tests
+#
+#==============================================================================================
+import memory
+import math
+import thread
+import os
+import sync
+import flate
+from binary import Reader, Buffer
+from raster import Raster, SampleType
+from raster_errors import corrupt, unsupported, invalid, limit
+
+let signature = b"\x89PNG\r\n\x1a\n"
+
+## A PNG's size and pixel format, from its header.
+pub struct Info:
+    pub var width: usize
+    pub var height: usize
+    ## 1, 2, 4, 8 or 16.
+    pub var bits: usize
+    ## 0 gray, 2 RGB, 3 palette, 4 gray and alpha, 6 RGBA.
+    pub var color: usize
+    pub var interlaced: bool
+    ## Whether it has alpha, from its colour type or a tRNS chunk.
+    pub var alpha: bool
+
+## How a decode runs.
+pub struct DecodeOptions:
+    ## Worker threads, counting the caller's; 0 uses every processor.
+    pub var threads: usize = 0
+    ## The most the decoder allocates besides the output.
+    pub var max_bytes: usize = 1073741824
+
+## Pixel layouts: channels and bits a sample.
+pub enum Format:
+    gray8
+    gray_alpha8
+    rgb8
+    rgba8
+    gray16
+    gray_alpha16
+    rgb16
+    rgba16
+
+## Receives `rows` decoded rows starting at `first_row`, tightly packed RGBA (8-bit
+## bytes, or 16-bit samples as native-endian byte pairs), on the decoding thread and
+## in top-to-bottom order.
+pub type RowSink = func(void*?, usize, usize, const u8[]) -> unit!
+
+## The header of the PNG in `data`.
+pub func info(data: const u8[]) -> Info!:
+    var parsed = try parse(data, false)
+    defer parsed.close()
+    return parsed.info
+
+## Fill `image`'s size, channels and format from its encoded bytes, ahead of
+## `allocate` and `decode`: Y, YA, RGB or RGBA (a palette is RGB, tRNS adds alpha).
+pub func probe(image: Raster*) -> !:
+    var parsed = try parse(image.encoded, true)
+    defer parsed.close()
+    let i = parsed.info
+    image.width = i.width
+    image.height = i.height
+    image.bits = i.bits
+    image.photo = (u64)i.color
+    image.interlaced = i.interlaced
+    image.palette = parsed.palette
+    image.transparency = parsed.transparency
+    let base = 3 if i.color == 3 else source_channels(i.color)
+    try image.standard(base + (1 if parsed.transparency.length > 0 else 0), .uint16 if i.bits == 16 else .uint8)
+    discard(try image.validate())
+    image.file_format = "PNG"
+
+## Decode a probed and allocated `image` into its f64 samples.
+pub func decode(image: Raster*) -> !:
+    if image.pixels.length != image.width * image.height * image.channels.length:
+        error(invalid, "PNG raster pixels are not allocated")
+    var target = Target(doubles = image.pixels, channels = image.channels.length)
+    try decode_into(image.encoded, &target, DecodeOptions(max_bytes = image.max_bytes))
+
+## Decode into `out` as 8-bit RGBA, `width * height * 4` bytes. 16-bit samples round
+## to the nearest 8-bit value.
+pub func decode_rgba8(data: const u8[], out: u8[], options: DecodeOptions = DecodeOptions()) -> !:
+    let i = try info(data)
+    if out.length < i.width * i.height * 4:
+        error(invalid, "PNG output buffer is smaller than the picture")
+    var target = Target(bytes = out)
+    try decode_into(data, &target, options)
+
+## Decode into `out` as 16-bit RGBA, `width * height * 4` samples; 8-bit samples
+## scale by 257.
+pub func decode_rgba16(data: const u8[], out: u16[], options: DecodeOptions = DecodeOptions()) -> !:
+    let i = try info(data)
+    if out.length < i.width * i.height * 4:
+        error(invalid, "PNG output buffer is smaller than the picture")
+    var target = Target(words = out)
+    try decode_into(data, &target, options)
+
+## Decode in bands of whole rows, each handed to `sink` with `context`, as RGBA with
+## 8 bits (`deep` false) or 16 bits a sample.
+pub func decode_rows(data: const u8[], sink: RowSink, context: void*?, deep: bool = false, options: DecodeOptions = DecodeOptions()) -> !:
+    var target = Target(sink = sink, context = context, deep = deep)
+    try decode_into(data, &target, options)
+
+## How an encode runs.
+pub struct EncodeOptions:
+    ## zlib level 0..9; 6 is zlib's default, 1 the fastest, 0 stores.
+    pub var level: i32 = 6
+    ## Row filtering: -1 picks per row by libpng's minimum sum of absolute
+    ## differences, 0..4 always uses None, Sub, Up, Average or Paeth.
+    pub var filter: i32 = -1
+    ## Worker threads, counting the caller's; 0 uses every processor.
+    pub var threads: usize = 0
+    ## Rows a band (the unit compressed and decoded in parallel); 0 for about a
+    ## megabyte of pixels.
+    pub var band_rows: usize = 0
+
+## Encode `width` x `height` RGBA pixels (row after row) as a PNG appended to `output`.
+pub func encode_rgba8(pixels: const u8[], width: usize, height: usize, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> !:
+    var encoder = try Encoder.begin(width, height, .rgba8, output, options)
+    defer encoder.close()
+    try encoder.write_rows(pixels, height)
+    try encoder.finish()
+
+## Encode 16-bit RGBA samples.
+pub func encode_rgba16(pixels: const u16[], width: usize, height: usize, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> !:
+    var encoder = try Encoder.begin(width, height, .rgba16, output, options)
+    defer encoder.close()
+    try encoder.write_rows16(pixels, height)
+    try encoder.finish()
+
+## Encode a Raster's uint8 or uint16 samples, 1 to 4 channels.
+pub func encode(image: const Raster*, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> !:
+    let nc = image.channels.length
+    if nc == 0 or nc > 4:
+        error(unsupported, "PNG supports one to four channels")
+    let kind = image.channels[0].kind
+    if kind != .uint8 and kind != .uint16:
+        error(unsupported, "PNG requires uint8 or uint16 channels")
+    for c in image.channels:
+        if c.kind != kind:
+            error(unsupported, "PNG requires matching channel sample types")
+    if image.pixels.length != image.width * image.height * nc:
+        error(invalid, "PNG raster pixels are not allocated")
+    let deep = kind == .uint16
+    let formats: Format[4] = [.gray8, .gray_alpha8, .rgb8, .rgba8]
+    let deep_formats: Format[4] = [.gray16, .gray_alpha16, .rgb16, .rgba16]
+    var encoder = try Encoder.begin(image.width, image.height, deep_formats[nc - 1] if deep else formats[nc - 1], output, options)
+    defer encoder.close()
+    # Samples to integers a few rows at a time.
+    let batch: usize = 32
+    let row = image.width * nc
+    let top = 65535.0 if deep else 255.0
+    let bytes = try alloc u8[batch * row] in memory.heap
+    defer free(bytes) in memory.heap
+    let words = try alloc u16[batch * row] in memory.heap
+    defer free(words) in memory.heap
+    var y: usize = 0
+    while y < image.height:
+        let rows = batch if y + batch <= image.height else image.height - y
+        let samples = image.pixels[y * row..<(y + rows) * row]
+        for i in 0..<samples.length:
+            # 2^52 + 2^51 added leaves a whole number in the low bits, and gives the
+            # value back exactly only if it was whole: no float-to-integer call.
+            let value = samples[i]
+            let t = value + 6755399441055744.0
+            if not (value >= 0.0 and value <= top) or t - 6755399441055744.0 != value:
+                error(invalid, "PNG sample is outside its integer range")
+            let whole = t.bits() -% 0x4338000000000000
+            if deep:
+                words[i] = (u16)whole
+            else:
+                bytes[i] = (u8)whole
+        if deep:
+            try encoder.write_rows16(words[..<rows * row], rows)
+        else:
+            try encoder.write_rows(bytes[..<rows * row], rows)
+        y += rows
+    try encoder.finish()
+
+func source_channels(color: usize) -> usize:
+    return 3 if color == 2 else 2 if color == 4 else 4 if color == 6 else 1
