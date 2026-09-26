@@ -401,7 +401,9 @@ func sequential_decode(data: const u8[], p: const Parsed*, l: const Layout*, tar
         try streamed_rows(data, p, l, target)
         return
     let stream = first if p.count == 1 else try join_pieces(data, p, total)
-    defer release_pieces(p, stream)
+    defer:
+        if p.count > 1:
+            free((u8[])stream) in memory.heap
     if stream.length < 6:
         error(corrupt, "invalid zlib header")
     try check_zlib_header(stream)
@@ -478,10 +480,6 @@ func join_pieces(data: const u8[], p: const Parsed*, total: usize) -> const u8[]
         memory.copy(joined[at..], piece, piece.length)
         at += piece.length
     return joined
-
-func release_pieces(p: const Parsed*, stream: const u8[]):
-    if p.count > 1:
-        free((u8[])stream) in memory.heap
 
 func check_zlib_header(stream: const u8[]) -> !:
     if (stream[0] & 15) != 8 or stream[0] >> 4 > 7 or (((u32)stream[0] << 8) | (u32)stream[1]) % 31 != 0:
@@ -608,6 +606,7 @@ func rows_in_order(p: const Parsed*, l: const Layout*, raw: u8[], target: Target
         buffer = try alloc u8[group * l.width * pixel] in memory.heap
         target.bytes = buffer
         target.first_row = 0
+    defer release(buffer)
     var offset: usize = 0
     for pass in 0..<passes:
         let xs = xstart[pass] if interlaced else 0
@@ -623,21 +622,16 @@ func rows_in_order(p: const Parsed*, l: const Layout*, raw: u8[], target: Target
             let at = raw.data + offset
             let above: const u8*? = none if y == 0 else at - rowbytes
             if not unfilter(at[0], at + 1, above, rowbytes, l.bpp):
-                release(buffer)
                 error(corrupt, "invalid PNG row filter")
             let picture_row = ys + y * dy
             if not convert_row(l, at + 1, w, picture_row, xs, dx, target):
-                release(buffer)
                 error(corrupt, "PNG palette index out of range")
             offset += rowbytes + 1
             if let deliver = target.sink:
                 if picture_row + 1 - target.first_row == group or picture_row + 1 == l.height:
                     let count = picture_row + 1 - target.first_row
-                    deliver(target.context, target.first_row, count, buffer[..<count * l.width * pixel]) catch failure:
-                        release(buffer)
-                        error(failure.code, failure.message)
+                    try deliver(target.context, target.first_row, count, buffer[..<count * l.width * pixel])
                     target.first_row = picture_row + 1
-    release(buffer)
 
 ## An interlaced picture's rows for a sink: every pass unfiltered in place,
 ## then a group of picture rows at a time made from the passes' rows that
