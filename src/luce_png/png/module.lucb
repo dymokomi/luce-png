@@ -60,6 +60,10 @@ pub struct DecodeOptions:
     pub var threads: usize = 0
     ## The most the decoder allocates besides the output.
     pub var max_bytes: usize = 1073741824
+    ## Row decodes of an interlaced picture: its first sight, Adam7's first
+    ## pass (every eighth pixel each way, 1/8 size) as RGBA, before its rows.
+    pub var coarse: CoarseSink? = none
+    pub var coarse_context: void*? = none
 
 ## Pixel layouts: channels and bits a sample.
 pub enum Format:
@@ -76,6 +80,10 @@ pub enum Format:
 ## bytes, or 16-bit samples as native-endian byte pairs), on the decoding thread and
 ## in top-to-bottom order.
 pub type RowSink = func(void*?, usize, usize, const u8[]) -> unit!
+
+## Receives a coarse picture, `width` by `height` 8-bit RGBA pixels, on the
+## decoding thread. A failure stops the decode.
+pub type CoarseSink = func(void*?, usize, usize, const u8[]) -> unit!
 
 ## The header of the PNG in `data`.
 pub func info(data: const u8[]) -> Info!:

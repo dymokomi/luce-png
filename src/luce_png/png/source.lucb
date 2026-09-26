@@ -198,6 +198,10 @@ struct Feed:
 func feed_more(context: void*?) -> const u8[]:
     let streamed = (Streamed*)(context else trap("a streamed decode has its state"))
     let feed = streamed.feed else trap("a file decode has a feed")
+    return more_of(feed)
+
+## The feed's next piece; a failure is kept for after the inflate.
+func more_of(feed: Feed*) -> const u8[]:
     return feed.next() catch failure:
         feed.failed = true
         feed.failure_code = failure.code
@@ -217,8 +221,8 @@ pub func decode_rows_at(read: ReadAt, source: void*?, size: u64, sink: RowSink, 
         total += parsed.pieces[i].length
     if total > options.max_bytes:
         error(limit, "PNG data exceeds byte limit")
-    if parsed.info.interlaced or parsed.pieces[0].length < 2:
-        # Adam7 fills the whole picture before any row is complete: from memory.
+    if parsed.pieces[0].length < 2:
+        # A zlib header split over chunks: from memory.
         if size > (u64)options.max_bytes:
             error(limit, "PNG file exceeds byte limit")
         let whole = try alloc u8[(usize)size] in memory.heap
@@ -228,6 +232,9 @@ pub func decode_rows_at(read: ReadAt, source: void*?, size: u64, sink: RowSink, 
         return
     var feed = try Feed.open(read, source, size, &parsed)
     defer feed.close()
+    if parsed.info.interlaced:
+        try interlaced_at(&feed, &parsed, &l, &target, options)
+        return
     if try parallel_decode_at(&feed, &parsed, &l, &target, threads, options):
         return
     try streamed_rows_at(&feed, &parsed, &l, &target)
@@ -340,3 +347,56 @@ func parallel_decode_at(feed: Feed*, p: const Parsed*, l: const Layout*, target:
 func group_bytes(p: const Parsed*, band: usize, count: usize) -> usize:
     let last = p.pieces[band + count]
     return last.start + last.length + 4 - (p.pieces[band + 1].start - 8)
+
+## An interlaced picture's scanlines, inflated from the file into one buffer
+## (Adam7's rows are complete only at the last pass), its first pass shown
+## as soon as it is in.
+struct Interlaced:
+    var feed: Feed*
+    var raw: u8[]
+    var filled: usize
+    var early: EarlyPass*
+    var wants_early: bool
+
+func interlaced_more(context: void*?) -> const u8[]:
+    let into = (Interlaced*)(context else trap("an interlaced decode has its state"))
+    return more_of(into.feed)
+
+func interlaced_take(context: void*?, bytes: const u8[]) -> !:
+    let into = (Interlaced*)(context else return)
+    if into.filled + bytes.length > into.raw.length:
+        error(corrupt, "PNG data is longer than its scanlines")
+    memory.copy(into.raw[into.filled..], bytes, bytes.length)
+    into.filled += bytes.length
+    if into.wants_early:
+        early_progress((void*)into.early, into.filled)
+        if into.early.failed:
+            error(into.early.code, into.early.message)
+
+func interlaced_at(feed: Feed*, p: const Parsed*, l: const Layout*, target: Target*, options: DecodeOptions) -> !:
+    let expected = scanline_bytes(l, true)
+    if expected > options.max_bytes:
+        error(invalid, "PNG scanlines exceed byte limit")
+    let first = try feed.next()
+    try check_zlib_header(first)
+    let raw = try alloc u8[expected] in memory.heap
+    defer free(raw) in memory.heap
+    let through = try alloc u8[streamed_window] in memory.heap
+    defer free(through) in memory.heap
+    var early = EarlyPass(raw = raw, layout = l, sink = options.coarse, context = options.coarse_context, done = false, failed = false, code = corrupt, message = "")
+    var into = Interlaced(feed = feed, raw = raw, filled = 0, early = &early, wants_early = options.coarse != none)
+    let used = flate.inflate_raw_windowed(first[2..], through, expected, interlaced_take, (void*)&into, interlaced_more) catch failure:
+        if feed.failed:
+            error(feed.failure_code, feed.failure)
+        error(failure.code, failure.message)
+    if feed.failed:
+        error(feed.failure_code, feed.failure)
+    if into.filled != expected:
+        error(corrupt, "truncated zlib stream")
+    var stored: u32 = 0
+    for index in 0..<(usize)4:
+        stored = (stored << 8) | (u32)(try feed.byte(2 + used + index))
+    if stored != flate.adler32(raw):
+        error(corrupt, "zlib Adler checksum mismatch")
+    try feed.drain()
+    try rows_in_order(p, l, raw, target)

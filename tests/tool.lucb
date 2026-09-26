@@ -1,7 +1,8 @@
 ## The gate's driver.
 ## `tool decode <in.png> <out.raw> <rgba8|rgba16|rows8|rows16|at8|at16> [threads]` writes a
 ## 12-byte header (width, height, bytes a pixel) and the pixels (16-bit samples
-## little-endian); `at` modes read the file in pieces through `decode_rows_at`.
+## little-endian); `at` modes read the file in pieces through `decode_rows_at`;
+## `coarse` writes an interlaced picture's first sight (Adam7's first pass) instead.
 ## `tool encode <in.png> <out.png> <level> <filter> <gray8|ga8|rgb8|rgba8|gray16|ga16|rgb16|rgba16>
 ## <whole|stream> [threads] [band rows]` encodes the input's pixels in that format.
 import files
@@ -23,6 +24,22 @@ func collect(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !
     collected.next_row = first + rows
     try collected.out.put(bytes)
 
+## A coarse picture kept.
+struct Coarse:
+    var out: Buffer*
+    var calls: usize
+
+func take_coarse(context: void*?, width: usize, height: usize, pixels: const u8[]) -> !:
+    let coarse = (Coarse*)(context else return)
+    try coarse.out.uint((u64)width, 4)
+    try coarse.out.uint((u64)height, 4)
+    try coarse.out.uint(4, 4)
+    try coarse.out.put(pixels)
+    coarse.calls += 1
+
+func ignore_rows(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !:
+    discard(context)
+
 ## `ReadAt` over an open file.
 func read_file(context: void*?, at: u64, into: u8[]) -> usize!:
     let file = (files.File*)(context else return 0)
@@ -39,6 +56,18 @@ pub func main(arguments: str[]) -> i32!:
     let info = try png.info(data)
     let w = info.width
     let h = info.height
+    if arguments[1] == "decode" and arguments[4] == "coarse":
+        var picture = Buffer()
+        defer picture.close()
+        var coarse = Coarse(out = &picture, calls = 0)
+        var file = try files.File.open((c.str)arguments[2])
+        defer file.destroy()
+        try png.decode_rows_at(read_file, (void*)&file, (u64)data.length, ignore_rows, none, options = png.DecodeOptions(coarse = take_coarse, coarse_context = (void*)&coarse))
+        if coarse.calls != (1 if info.interlaced else 0):
+            print("a coarse picture came for a picture not interlaced, or not once for one that is")
+            return 1
+        try files.write((c.str)arguments[3], picture.view())
+        return 0
     if arguments[1] == "decode":
         let mode = arguments[4]
         let options = png.DecodeOptions(threads = (usize)number(arguments, 5, 0))

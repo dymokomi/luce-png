@@ -98,6 +98,26 @@ def check_decoding(tmp, flags, dump, tool):
             if reference != shallow:
                 fail(f"{name}: RGBA8 differs from libpng")
             compared += 1
+    # An interlaced picture's first sight is Adam7's first pass: every eighth
+    # pixel each way of the picture as it decodes whole.
+    early = 0
+    for fixture in FIXTURES:
+        width, height, bits, color = header(fixture)
+        coarse = tmp / "coarse"
+        coarse.unlink(missing_ok=True)
+        if run([tool, "decode", fixture, coarse, "coarse", 0]).returncode != 0:
+            fail(f"{fixture.name}: the coarse decode failed")
+        if coarse.stat().st_size == 0:
+            continue
+        run([tool, "decode", fixture, out, "rgba8", 0], check=True)
+        full = read_raw(out)[3]
+        w, h, _, pixels = read_raw(coarse)
+        expected = b"".join(full[(y * 8 * width + x * 8) * 4:(y * 8 * width + x * 8) * 4 + 4] for y in range(h) for x in range(w))
+        if (w, h) != ((width + 7) // 8, (height + 7) // 8) or pixels != expected:
+            fail(f"{fixture.name}: the first pass is not every eighth pixel")
+        early += 1
+    if early < 5:
+        fail(f"only {early} interlaced fixtures gave a first sight")
     print(f"ok    {len(FIXTURES)} fixtures identical to the 0.1 decoder through every API"
           + (f"; {compared} identical to libpng" if Image else "; Pillow absent, libpng comparisons skipped"))
 

@@ -415,7 +415,14 @@ func sequential_decode(data: const u8[], p: const Parsed*, l: const Layout*, tar
     if pipelined:
         try pipelined_inflate(stream, raw, l, target, threads)
         return
-    let used = try flate.inflate_raw(stream[2..], raw)
+    # An interlaced picture's rows come at its last pass: its first shows it early.
+    var early = EarlyPass(raw = raw, layout = l, sink = options.coarse, context = options.coarse_context, done = false, failed = false, code = corrupt, message = "")
+    let wants_early = p.info.interlaced and target.sink != none and options.coarse != none
+    let used = try flate.inflate_raw(stream[2..], raw, early_progress if wants_early else none, (void*)&early)
+    if wants_early:
+        early_progress((void*)&early, raw.length)
+        if early.failed:
+            error(early.code, early.message)
     try check_adler(stream, 2 + used, flate.adler32(raw))
     try rows_in_order(p, l, raw, target)
 
@@ -590,14 +597,15 @@ func min_size(a: usize, b: usize) -> usize:
 ## row sink in groups of rows.
 func rows_in_order(p: const Parsed*, l: const Layout*, raw: u8[], target: Target*) -> !:
     let interlaced = p.info.interlaced
+    if interlaced and target.sink != none:
+        try interlaced_rows(l, raw, target)
+        return
     let passes: usize = 7 if interlaced else 1
     let pixel: usize = 8 if target.deep else 4
     let group: usize = 64
     var buffer: u8[]
     if target.sink != none:
-        # Interlaced rows fill the whole picture before any row is complete.
-        let rows = l.height if interlaced else group
-        buffer = try alloc u8[rows * l.width * pixel] in memory.heap
+        buffer = try alloc u8[group * l.width * pixel] in memory.heap
         target.bytes = buffer
         target.first_row = 0
     var offset: usize = 0
@@ -622,21 +630,109 @@ func rows_in_order(p: const Parsed*, l: const Layout*, raw: u8[], target: Target
                 release(buffer)
                 error(corrupt, "PNG palette index out of range")
             offset += rowbytes + 1
-            if not interlaced:
-                if let deliver = target.sink:
-                    if picture_row + 1 - target.first_row == group or picture_row + 1 == l.height:
-                        let count = picture_row + 1 - target.first_row
-                        deliver(target.context, target.first_row, count, buffer[..<count * l.width * pixel]) catch failure:
-                            release(buffer)
-                            error(failure.code, failure.message)
-                        target.first_row = picture_row + 1
-    if interlaced:
-        if let deliver = target.sink:
-            deliver(target.context, 0, l.height, buffer[..<l.height * l.width * pixel]) catch failure:
-                release(buffer)
-                error(failure.code, failure.message)
+            if let deliver = target.sink:
+                if picture_row + 1 - target.first_row == group or picture_row + 1 == l.height:
+                    let count = picture_row + 1 - target.first_row
+                    deliver(target.context, target.first_row, count, buffer[..<count * l.width * pixel]) catch failure:
+                        release(buffer)
+                        error(failure.code, failure.message)
+                    target.first_row = picture_row + 1
     release(buffer)
+
+## An interlaced picture's rows for a sink: every pass unfiltered in place,
+## then a group of picture rows at a time made from the passes' rows that
+## fall in it, so only a group of converted rows is held besides the scanlines.
+func interlaced_rows(l: const Layout*, raw: u8[], target: Target*) -> !:
+    let deliver = target.sink else trap("interlaced rows go to a sink")
+    var starts: usize[7]
+    var offset: usize = 0
+    for pass in 0..<(usize)7:
+        starts[pass] = offset
+        let w = extent(l.width, xstart[pass], xstep[pass])
+        let h = extent(l.height, ystart[pass], ystep[pass])
+        if w == 0 or h == 0:
+            continue
+        let rowbytes = l.row_bytes(w)
+        for y in 0..<h:
+            let at = raw.data + offset
+            let above: const u8*? = none if y == 0 else at - rowbytes
+            if not unfilter(at[0], at + 1, above, rowbytes, l.bpp):
+                error(corrupt, "invalid PNG row filter")
+            offset += rowbytes + 1
+    let pixel: usize = 8 if target.deep else 4
+    let group: usize = 64
+    let buffer = try alloc u8[group * l.width * pixel] in memory.heap
+    defer free(buffer) in memory.heap
+    target.bytes = buffer
+    var first: usize = 0
+    while first < l.height:
+        let count = group if first + group <= l.height else l.height - first
+        target.first_row = first
+        for y in first..<first + count:
+            for pass in 0..<(usize)7:
+                let ys = ystart[pass]
+                let dy = ystep[pass]
+                let w = extent(l.width, xstart[pass], xstep[pass])
+                if w == 0 or y < ys or (y - ys) % dy != 0:
+                    continue
+                let at = raw.data + starts[pass] + ((y - ys) // dy) * (l.row_bytes(w) + 1)
+                if not convert_row(l, at + 1, w, y, xstart[pass], xstep[pass], target):
+                    error(corrupt, "PNG palette index out of range")
+        try deliver(target.context, first, count, buffer[..<count * l.width * pixel])
+        first += count
 
 func release(buffer: u8[]):
     if buffer.length > 0:
         free(buffer) in memory.heap
+
+## Adam7's first pass shown as soon as it is inflated: every eighth pixel each
+## way, the picture at 1/8 size, to a coarse sink.
+struct EarlyPass:
+    var raw: const u8[]
+    var layout: const Layout*
+    var sink: CoarseSink?
+    var context: void*?
+    var done: bool
+    ## A failure in the inflater's progress, which cannot fail itself.
+    var failed: bool
+    var code: ErrorCode
+    var message: str
+
+## The inflater's progress: once pass 1 is in, it goes to the sink.
+func early_progress(context: void*?, produced: usize):
+    let early = (EarlyPass*)(context else return)
+    if early.done:
+        return
+    let l = early.layout
+    let w = extent(l.width, xstart[0], xstep[0])
+    let h = extent(l.height, ystart[0], ystep[0])
+    let stride = l.row_bytes(w) + 1
+    if produced < stride * h:
+        return
+    early.done = true
+    first_pass(early, w, h, stride) catch failure:
+        early.failed = true
+        early.code = failure.code
+        early.message = failure.message
+        recover ()
+
+## Pass 1 unfiltered (a copy: the rows are unfiltered in place later) and
+## converted to RGBA for the sink.
+func first_pass(early: EarlyPass*, w: usize, h: usize, stride: usize) -> !:
+    let sink = early.sink else return
+    let lines = try alloc u8[stride * h] in memory.heap
+    defer free(lines) in memory.heap
+    memory.copy(lines, early.raw, stride * h)
+    let pixels = try alloc u8[w * h * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    var small = *early.layout
+    small.width = w
+    var target = Target(bytes = pixels)
+    for y in 0..<h:
+        let at = lines.data + y * stride
+        let above: const u8*? = none if y == 0 else at - stride + 1
+        if not unfilter(at[0], at + 1, above, stride - 1, small.bpp):
+            error(corrupt, "invalid PNG row filter")
+        if not convert_row(&small, at + 1, w, y, 0, 1, &target):
+            error(corrupt, "PNG palette index out of range")
+    try sink(early.context, w, h, pixels)

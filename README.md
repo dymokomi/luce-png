@@ -22,7 +22,7 @@ try png.decode(&raster)
 
 Every colour type and depth, palettes, tRNS and Adam7. PNGs this encoder wrote decode band by band on every processor (see below); any other PNG inflates on the calling thread while up to seven threads unfilter the rows behind it in a wavefront (each row a few kilobytes behind the one above) and another checks the Adler-32.
 
-`decode_rows_at` never holds the file: `read(context, offset, buffer)` gives its bytes. The chunks are walked in place, then the IDAT data is read a megabyte block at a time into the inflate window (banded files a group of bands at a time, decoded on every processor), each chunk's CRC checked as it goes. Interlaced files, whose rows complete only at the last pass, are read whole.
+`decode_rows_at` never holds the file: `read(context, offset, buffer)` gives its bytes. The chunks are walked in place, then the IDAT data is read a megabyte block at a time into the inflate window (banded files a group of bands at a time, decoded on every processor), each chunk's CRC checked as it goes. Interlaced files, whose rows complete only at the last pass, inflate into all their scanlines first, a block of the file at a time; `DecodeOptions.coarse` hears their first pass (every eighth pixel each way) as soon as it is in.
 
 ## Encoding
 
