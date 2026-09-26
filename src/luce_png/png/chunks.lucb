@@ -85,6 +85,31 @@ func parse(data: const u8[], check_idat: bool) -> Parsed!:
             break
     return try walk.finish(&result)
 
+## The chunks before the first IDAT of a file's start: its header, palette and
+## transparency, for a probe.
+func parse_head(data: const u8[]) -> Parsed!:
+    var result = Parsed()
+    errdefer result.close()
+    var reader = Reader(data = data, little = false)
+    if (str)(try reader.take(8)) != (str)signature:
+        error(corrupt, "invalid PNG signature")
+    var walk = Walk()
+    while reader.position + 8 <= reader.data.length:
+        let size = (usize)(try reader.uint(4))
+        let start = reader.position
+        let name = (str)(try reader.take(4))
+        if name == "IDAT" or name == "IEND":
+            break
+        let body = try reader.take(size)
+        discard(try reader.uint(4))
+        if not chunk_crc_ok(data, start, size):
+            error(corrupt, "PNG CRC mismatch")
+        try take_chunk(&result, &walk, name, body, start, size)
+    if not walk.header:
+        error(corrupt, "PNG must start with IHDR")
+    result.info.alpha = result.info.color == 4 or result.info.color == 6 or result.transparency.length > 0
+    return result
+
 ## Where a walk through the chunks stands.
 struct Walk:
     var header: bool

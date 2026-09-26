@@ -272,3 +272,42 @@ test "a file read in pieces decodes as the file whole, its banded and general pa
     held = Held(data = out.view(), reads = 0, largest = 0)
     try decode_rows_at(read_held, (void*)&held, (u64)out.view().length, collect, (void*)&rows)
     assert(held.largest <= feed_block and held.reads > 2)
+
+test "the start of a file up to its first IDAT probes as the file whole":
+    # A palette with transparency, so the probe's slices come from the start.
+    var out = Buffer()
+    defer out.close()
+    try out.put(signature)
+    var header: u8[13]
+    put32(&header[0], 4)
+    put32(&header[4], 2)
+    header[8] = 8
+    header[9] = 3
+    try chunk(&out, "IHDR", header)
+    try chunk(&out, "PLTE", b"\x00\x00\x00\xff\x00\x00")
+    try chunk(&out, "tRNS", b"\x80")
+    let raw: u8[10] = [0, 0, 1, 0, 1, 0, 1, 1, 0, 0]
+    var packed: u8[1024]
+    let used = try flate.deflate_zlib(raw, 6, packed)
+    try chunk(&out, "IDAT", packed[..<used])
+    try chunk(&out, "IEND", b"")
+    let data = out.view()
+    var have: usize = 1
+    while true:
+        let need = try head_bytes(data[..<have])
+        if need == 0:
+            break
+        assert(need > have and need <= data.length)
+        have = need
+    var whole = Raster()
+    defer whole.close()
+    whole.encoded = try alloc u8[data.length] in memory.heap
+    memory.copy(whole.encoded, data, data.length)
+    try probe(&whole)
+    var head = Raster()
+    defer head.close()
+    head.encoded = try alloc u8[have] in memory.heap
+    memory.copy(head.encoded, data, have)
+    try probe_head(&head)
+    assert(head.width == 4 and head.height == 2 and head.channels.length == whole.channels.length and head.photo == 3)
+    assert((str)head.palette == (str)whole.palette and (str)head.transparency == (str)whole.transparency)

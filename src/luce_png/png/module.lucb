@@ -88,6 +88,34 @@ pub func info(data: const u8[]) -> Info!:
 pub func probe(image: Raster*) -> !:
     var parsed = try parse(image.encoded, true)
     defer parsed.close()
+    try probed(image, &parsed)
+
+## `probe` from the start of a file up to its first IDAT chunk (`head_bytes`
+## says how much that is), for a file read in pieces later (`decode_rows_at`).
+pub func probe_head(image: Raster*) -> !:
+    var parsed = try parse_head(image.encoded)
+    defer parsed.close()
+    try probed(image, &parsed)
+
+## Bytes of the start of a file, whose first `data.length` are `data`, up to its
+## first IDAT chunk: 0 when `data` holds them all, else how many it takes to go
+## on (at least one chunk header more). Fails when the file is not a PNG.
+pub func head_bytes(data: const u8[]) -> usize!:
+    if data.length < 8:
+        return 8
+    if (str)data[..<8] != (str)signature:
+        error(corrupt, "invalid PNG signature")
+    var at: usize = 8
+    while true:
+        if at + 8 > data.length:
+            return at + 8
+        let length = ((usize)data[at] << 24) | ((usize)data[at + 1] << 16) | ((usize)data[at + 2] << 8) | (usize)data[at + 3]
+        if (str)data[at + 4..<at + 8] == "IDAT" or (str)data[at + 4..<at + 8] == "IEND":
+            return 0
+        at += 12 + length
+    return 0
+
+func probed(image: Raster*, parsed: const Parsed*) -> !:
     let i = parsed.info
     image.width = i.width
     image.height = i.height
