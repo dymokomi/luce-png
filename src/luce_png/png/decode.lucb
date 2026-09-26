@@ -10,7 +10,9 @@
 #
 #       The general path inflates the whole stream on the calling thread while a second
 #       thread checksums, unfilters and converts each row as soon as it is complete.
-#       Interlaced pictures and row callbacks inflate first and then work row by row.
+#       Row callbacks inflate through a window instead, each row unfiltered and handed
+#       on as it completes, so a picture of any size holds a few rows, not all of them.
+#       Interlaced pictures inflate first and then work pass by pass.
 #
 #==============================================================================================
 
@@ -392,12 +394,17 @@ func sequential_decode(data: const u8[], p: const Parsed*, l: const Layout*, tar
         total += p.pieces[i].length
     if total > options.max_bytes:
         error(limit, "PNG data exceeds byte limit")
-    let stream = p.piece(data, 0) if p.count == 1 else try join_pieces(data, p, total)
+    let first = p.piece(data, 0)
+    if target.sink != none and not p.info.interlaced and first.length >= 2:
+        # Rows stream from the IDAT chunks where they lie, never joined.
+        try check_zlib_header(first)
+        try streamed_rows(data, p, l, target)
+        return
+    let stream = first if p.count == 1 else try join_pieces(data, p, total)
     defer release_pieces(p, stream)
-    if stream.length < 6 or (stream[0] & 15) != 8 or stream[0] >> 4 > 7 or (((u32)stream[0] << 8) | (u32)stream[1]) % 31 != 0:
+    if stream.length < 6:
         error(corrupt, "invalid zlib header")
-    if (stream[1] & 32) != 0:
-        error(unsupported, "preset zlib dictionaries are not supported")
+    try check_zlib_header(stream)
     let expected = scanline_bytes(l, p.info.interlaced)
     if expected > options.max_bytes:
         error(invalid, "PNG scanlines exceed byte limit")
@@ -468,6 +475,114 @@ func join_pieces(data: const u8[], p: const Parsed*, total: usize) -> const u8[]
 func release_pieces(p: const Parsed*, stream: const u8[]):
     if p.count > 1:
         free((u8[])stream) in memory.heap
+
+func check_zlib_header(stream: const u8[]) -> !:
+    if (stream[0] & 15) != 8 or stream[0] >> 4 > 7 or (((u32)stream[0] << 8) | (u32)stream[1]) % 31 != 0:
+        error(corrupt, "invalid zlib header")
+    if (stream[1] & 32) != 0:
+        error(unsupported, "preset zlib dictionaries are not supported")
+
+## Rows for a sink as the stream inflates: the scanline above, the one being
+## filled and a group of converted rows, besides the inflate window; the
+## IDAT chunks are read in place, one after another.
+struct Streamed:
+    var data: const u8[]
+    var parsed: const Parsed*
+    ## The next IDAT chunk the inflater takes.
+    var next_piece: usize
+    var layout: const Layout*
+    var target: Target*
+    ## Scanline bytes, filter byte included.
+    var stride: usize
+    var above: u8[]
+    var current: u8[]
+    var filled: usize
+    ## The picture row being filled, and the Adler-32 of what came so far.
+    var row: usize
+    var adler: u32
+
+## Rows handed to a sink at once.
+let streamed_group: usize = 64
+
+## Bytes of the window a streamed decode inflates through.
+let streamed_window: usize = 1048576
+
+func streamed_rows(data: const u8[], p: const Parsed*, l: const Layout*, target: Target*) -> !:
+    let stride = l.row_bytes(l.width) + 1
+    let pixel: usize = 8 if target.deep else 4
+    let through = try alloc u8[streamed_window] in memory.heap
+    defer free(through) in memory.heap
+    let lines = try alloc u8[stride * 2] in memory.heap
+    defer free(lines) in memory.heap
+    let group = try alloc u8[streamed_group * l.width * pixel] in memory.heap
+    defer free(group) in memory.heap
+    target.bytes = group
+    target.first_row = 0
+    var streamed = Streamed(data = data, parsed = p, next_piece = 1, layout = l, target = target, stride = stride, above = lines[..<stride], current = lines[stride..], filled = 0, row = 0, adler = 1)
+    let used = try flate.inflate_raw_windowed(p.piece(data, 0)[2..], through, stride * l.height, take_inflated, (void*)&streamed, more_idat)
+    # The Adler-32 follows the deflate data, in whichever chunks it falls.
+    var stored: u32 = 0
+    for index in 0..<(usize)4:
+        stored = (stored << 8) | (u32)(try idat_byte(data, p, 2 + used + index))
+    if stored != streamed.adler:
+        error(corrupt, "zlib Adler checksum mismatch")
+
+## The inflater's next IDAT chunk; none left at the end.
+func more_idat(context: void*?) -> const u8[]:
+    let streamed = (Streamed*)(context else trap("a streamed decode has its state"))
+    if streamed.next_piece >= streamed.parsed.count:
+        return streamed.data[..<0]
+    streamed.next_piece += 1
+    return streamed.parsed.piece(streamed.data, streamed.next_piece - 1)
+
+## Byte `offset` of the IDAT data, as if its chunks were joined.
+func idat_byte(data: const u8[], p: const Parsed*, offset: usize) -> u8!:
+    var at = offset
+    for index in 0..<p.count:
+        let piece = p.piece(data, index)
+        if at < piece.length:
+            return piece[at]
+        at -= piece.length
+    error(corrupt, "truncated zlib stream")
+
+## Inflated bytes into scanlines; each one complete is unfiltered, converted
+## and, a group at a time, handed on.
+func take_inflated(context: void*?, bytes: const u8[]) -> !:
+    let streamed = (Streamed*)(context else return)
+    streamed.adler = flate.adler32(bytes, streamed.adler)
+    var at: usize = 0
+    while at < bytes.length:
+        let part = min_size(streamed.stride - streamed.filled, bytes.length - at)
+        memory.copy(streamed.current[streamed.filled..], bytes[at..], part)
+        streamed.filled += part
+        at += part
+        if streamed.filled == streamed.stride:
+            try streamed_row(streamed)
+
+func streamed_row(streamed: Streamed*) -> !:
+    let l = streamed.layout
+    let target = streamed.target
+    let line = streamed.current.data
+    let above: const u8*? = none if streamed.row == 0 else streamed.above.data + 1
+    if not unfilter(line[0], line + 1, above, streamed.stride - 1, l.bpp):
+        error(corrupt, "invalid PNG row filter")
+    if not convert_row(l, line + 1, l.width, streamed.row, 0, 1, target):
+        error(corrupt, "PNG palette index out of range")
+    streamed.row += 1
+    let count = streamed.row - target.first_row
+    if count == streamed_group or streamed.row == l.height:
+        let deliver = target.sink else trap("a streamed decode has a sink")
+        let pixel: usize = 8 if target.deep else 4
+        try deliver(target.context, target.first_row, count, target.bytes[..<count * l.width * pixel])
+        target.first_row = streamed.row
+    # This row is the next one's above.
+    let done = streamed.current
+    streamed.current = streamed.above
+    streamed.above = done
+    streamed.filled = 0
+
+func min_size(a: usize, b: usize) -> usize:
+    return a if a < b else b
 
 ## Unfilter and convert inflated scanlines on this thread, pass by pass, feeding a
 ## row sink in groups of rows.

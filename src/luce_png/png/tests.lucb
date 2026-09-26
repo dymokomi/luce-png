@@ -98,3 +98,72 @@ test "the encoder refuses bad requests":
         refused = failure.code == invalid
         recover ()
     assert(refused)
+
+## Rows a sink was handed, kept in one picture, checking they come in order.
+struct Collected:
+    var pixels: u8[]
+    var next: usize
+    var calls: usize
+
+func collect(context: void*?, first: usize, count: usize, bytes: const u8[]) -> !:
+    let into = (Collected*)(context else return)
+    if first != into.next:
+        error(invalid, "rows out of order")
+    let width = bytes.length // count
+    memory.copy(into.pixels[first * width..], bytes, bytes.length)
+    into.next = first + count
+    into.calls += 1
+
+test "a PNG from another encoder streams its rows through an inflate window":
+    # RGB rows, every filter in turn, deflated whole and split over IDAT chunks as
+    # other encoders write them: the general path, not the banded one.
+    let width: usize = 1200
+    let height: usize = 400
+    let stride = width * 3 + 1
+    let raw = try alloc u8[stride * height] in memory.heap
+    defer free(raw) in memory.heap
+    for y in 0..<height:
+        raw[y * stride] = (u8)(y % 5)
+        for x in 1..<stride:
+            raw[y * stride + x] = (u8)((x * 7 + y * 13 + (x * y) // 97) % 256)
+    let packed = try alloc u8[raw.length + 4096] in memory.heap
+    defer free(packed) in memory.heap
+    let used = try flate.deflate_zlib(raw, 6, packed)
+    var out = Buffer()
+    defer out.close()
+    try out.put(signature)
+    var header: u8[13]
+    put32(&header[0], (u32)width)
+    put32(&header[4], (u32)height)
+    header[8] = 8
+    header[9] = 2
+    try chunk(&out, "IHDR", header)
+    let third = used // 3
+    try chunk(&out, "IDAT", packed[..<third])
+    try chunk(&out, "IDAT", packed[third..<2 * third])
+    try chunk(&out, "IDAT", packed[2 * third..<used])
+    try chunk(&out, "IEND", b"")
+    let whole = try alloc u8[width * height * 4] in memory.heap
+    defer free(whole) in memory.heap
+    try decode_rgba8(out.view(), whole)
+    var rows = Collected(pixels = try alloc u8[width * height * 4] in memory.heap, next = 0, calls = 0)
+    defer free(rows.pixels) in memory.heap
+    try decode_rows(out.view(), collect, (void*)&rows)
+    assert(rows.next == height and rows.calls == (height + 63) // 64)
+    for i in 0..<whole.length:
+        assert(rows.pixels[i] == whole[i])
+    # A damaged filter byte fails the streamed decode too.
+    raw[5 * stride] = 9
+    let damaged = try flate.deflate_zlib(raw, 6, packed)
+    var bad = Buffer()
+    defer bad.close()
+    try bad.put(signature)
+    try chunk(&bad, "IHDR", header)
+    try chunk(&bad, "IDAT", packed[..<damaged])
+    try chunk(&bad, "IEND", b"")
+    rows.next = 0
+    var failed = false
+    decode_rows(bad.view(), collect, (void*)&rows) catch failure:
+        failed = failure.code == corrupt
+        recover ()
+    assert(failed)
