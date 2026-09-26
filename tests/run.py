@@ -3,8 +3,9 @@
 
 - every fixture decodes through the Raster API to exactly the samples of the 0.1
   decoder built the same way (tests/fixtures/golden.txt);
-- decode_rgba16, decode_rgba8 and decode_rows agree with those samples, on one
-  thread and on several, and (with Pillow) with libpng for 8-bit files;
+- decode_rgba16, decode_rgba8, decode_rows and decode_rows_at (the file read in
+  pieces) agree with those samples, on one thread and on several, and (with
+  Pillow) with libpng for 8-bit files;
 - the encoder is lossless in every format, gives the same bytes on one thread, on
   all and streamed, at every level and filter, in one band or many; its files
   decode the same here in parallel and sequentially and (with Pillow) in libpng;
@@ -14,7 +15,7 @@ import hashlib, os, random, struct, subprocess, tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE = (ROOT.parent / "luce-base/build/luce-base").resolve()
+BASE = Path(os.environ.get("LUCE_BASE", ROOT.parent / "luce-base/build/luce-base")).resolve()
 MODES = [["--native"], ["--backend=c"]]
 env = dict(os.environ, LUCE_BASE=str(BASE), LUCE_STD=str((ROOT.parent / "luce-base/src/std").resolve()))
 FIXTURES = sorted((ROOT / "tests/fixtures").glob("*.png"))
@@ -85,7 +86,7 @@ def check_decoding(tmp, flags, dump, tool):
         width, height, bits, color = header(fixture)
         deep = expected_rgba16(raw, bits)
         shallow = bytes((v * 255 + 32767) // 65535 for v in deep)
-        for mode, threads in [("rgba16", 1), ("rgba16", 0), ("rows16", 0), ("rgba8", 1), ("rgba8", 0), ("rows8", 3)]:
+        for mode, threads in [("rgba16", 1), ("rgba16", 0), ("rows16", 0), ("rgba8", 1), ("rgba8", 0), ("rows8", 3), ("at8", 0), ("at16", 2)]:
             if run([tool, "decode", fixture, out, mode, threads]).returncode != 0:
                 fail(f"{name}: {mode} decode on {threads} threads failed")
             pixels = read_raw(out)[3]
@@ -164,7 +165,7 @@ def check_damage(tmp, dump, tool):
             cases.append(bytes(changed))
         for case in cases:
             bad.write_bytes(case)
-            for command in [[dump, bad, tmp / "raw"], [tool, "decode", bad, tmp / "out", "rgba8", 0], [tool, "decode", bad, tmp / "out", "rows8", 0]]:
+            for command in [[dump, bad, tmp / "raw"], [tool, "decode", bad, tmp / "out", "rgba8", 0], [tool, "decode", bad, tmp / "out", "rows8", 0], [tool, "decode", bad, tmp / "out", "at8", 0]]:
                 result = run(command, capture_output=True)
                 if result.returncode not in (0, 1):
                     fail(f"{path.name}: a damaged file ended the process with {result.returncode}")

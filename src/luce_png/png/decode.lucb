@@ -500,6 +500,8 @@ struct Streamed:
     ## The picture row being filled, and the Adler-32 of what came so far.
     var row: usize
     var adler: u32
+    ## Where the IDAT data comes from when it is read from a file (png/source).
+    var feed: Feed*?
 
 ## Rows handed to a sink at once.
 let streamed_group: usize = 64

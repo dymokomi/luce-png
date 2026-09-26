@@ -2,6 +2,7 @@ module.lucb
 chunks.lucb
 filters.lucb
 decode.lucb
+source.lucb
 encode.lucb
 work.lucb
 tests.lucb

@@ -5,7 +5,8 @@
 #   DESCRIPTION:
 #       Static PNG: every standard colour type and bit depth, palettes, tRNS and Adam7.
 #       Decoding goes to 8-bit or 16-bit RGBA (`decode_rgba8`, `decode_rgba16`), to a
-#       row callback (`decode_rows`), or to a Raster's f64 samples (`probe`, `decode`).
+#       row callback (`decode_rows`, or `decode_rows_at` reading the file in pieces), or
+#       to a Raster's f64 samples (`probe`, `decode`).
 #       Encoding takes 8- or 16-bit gray, gray-alpha, RGB or RGBA rows at once
 #       (`encode_rgba8`...) or pushed in bands through an `Encoder`, or a Raster.
 #
@@ -23,6 +24,7 @@
 #       chunks.lucb    chunk parsing, the header, palette and transparency
 #       filters.lucb   filtering and unfiltering rows
 #       decode.lucb    parallel and sequential decoding, Adam7, output conversion
+#       source.lucb    decoding from a file read in pieces (`decode_rows_at`)
 #       encode.lucb    the Encoder: bands, chunks and the zlib stream around them
 #       work.lucb      the worker threads
 #       tests.lucb     the module's tests

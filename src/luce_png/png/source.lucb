@@ -1,0 +1,342 @@
+#==============================================================================================
+#
+#   png/source - Decoding from a file read in pieces
+#
+#   DESCRIPTION:
+#       `decode_rows` takes the file whole in memory. A PNG of hundreds of megabytes need
+#       not be: `decode_rows_at` reads it through a `ReadAt` instead. The chunks are walked
+#       in place (`parse_at`: a small read a chunk, the IDAT data skipped), then the IDAT
+#       data is read a block at a time into the inflate window (`Feed`), its CRCs checked
+#       as it goes. A file with this encoder's `luPD` bands reads a group of bands at a
+#       time and decodes them on every processor. So besides the rows it hands on the
+#       decode holds a block of the file, never the file.
+#
+#==============================================================================================
+
+## Reads bytes of a file at offset `at` into `into`: how many it read, fewer
+## only at the end of the file.
+pub type ReadAt = func(void*?, u64, u8[]) -> usize!
+
+## Bytes of the file read at once.
+let feed_block: usize = 1048576
+
+## Read exactly `into.length` bytes at `at`.
+func read_exactly(read: ReadAt, source: void*?, at: u64, into: u8[]) -> !:
+    var done: usize = 0
+    while done < into.length:
+        let count = try read(source, at + (u64)done, into[done..])
+        if count == 0:
+            error(corrupt, "the PNG file ended early")
+        done += count
+
+## The chunks of a `size`-byte file walked in place: each chunk's header and
+## (but for IDAT) its data read and checked; IDAT data is left in the file.
+func parse_at(read: ReadAt, source: void*?, size: u64, max_bytes: usize) -> Parsed!:
+    var result = Parsed()
+    errdefer result.close()
+    var head: u8[8]
+    if size < 8:
+        error(corrupt, "invalid PNG signature")
+    try read_exactly(read, source, 0, head)
+    if (str)head[..<8] != (str)signature:
+        error(corrupt, "invalid PNG signature")
+    # The palette and transparency outlive their reads: 768 bytes each at most.
+    result.kept = try alloc u8[1536] in memory.heap
+    var walk = Walk()
+    var at: u64 = 8
+    while at < size:
+        if at + 12 > size:
+            error(corrupt, "truncated PNG chunk")
+        try read_exactly(read, source, at, head)
+        let length = ((u32)head[0] << 24) | ((u32)head[1] << 16) | ((u32)head[2] << 8) | (u32)head[3]
+        let name = (str)head[4..<8]
+        if at + 12 + (u64)length > size:
+            error(corrupt, "truncated PNG chunk")
+        let start = (usize)at + 4
+        if name == "IDAT":
+            try take_chunk(&result, &walk, name, head[..<0], start, (usize)length)
+        else:
+            if (usize)length > max_bytes:
+                error(limit, "PNG chunk exceeds byte limit")
+            try take_read_chunk(read, source, at, (usize)length, &result, &walk, name)
+        at += 12 + (u64)length
+        if walk.end:
+            if at != size:
+                error(corrupt, "invalid PNG IEND")
+            break
+    return try walk.finish(&result)
+
+## A chunk other than IDAT at `at`, `length` bytes of data: read with its CRC,
+## checked, and taken; a palette or transparency is kept.
+func take_read_chunk(read: ReadAt, source: void*?, at: u64, length: usize, result: Parsed*, walk: Walk*, name: str) -> !:
+    let whole = try alloc u8[length + 8] in memory.heap
+    defer free(whole) in memory.heap
+    try read_exactly(read, source, at + 4, whole)
+    if not chunk_crc_ok(whole, 0, length):
+        error(corrupt, "PNG CRC mismatch")
+    var body: const u8[] = whole[4..<4 + length]
+    if (name == "PLTE" or name == "tRNS") and length <= 768:
+        let kept = result.kept[(0 if name == "PLTE" else 768)..]
+        memory.copy(kept, body, length)
+        body = kept[..<length]
+    try take_chunk(result, walk, name, body, (usize)at + 4, length)
+
+## The IDAT data of a parsed file handed on a piece at a time, as a windowed
+## inflate asks for it: each piece is the part of a chunk's data in the block
+## of the file read last. Each chunk's CRC is checked once its data is out.
+struct Feed:
+    var read: ReadAt
+    var source: void*?
+    var size: u64
+    var parsed: const Parsed*
+    var block: u8[]
+    ## Where the block starts in the file, and the bytes read into it.
+    var block_at: u64
+    var block_length: usize
+    ## The chunk being handed on, its data handed on so far, and its CRC so far.
+    var chunk: usize
+    var offset: usize
+    var crc: u32
+    ## The IDAT data handed on before the current piece, and the piece.
+    var base: usize
+    var piece: const u8[]
+    ## The last bytes of the pieces before the current one (the inflater reads
+    ## a few bytes ahead, so the stream's end may lie just before it).
+    var tail: u8[8]
+    var tail_length: usize
+    ## A failure inside `more`, which cannot fail itself.
+    var failed: bool
+    var failure_code: ErrorCode
+    var failure: str
+
+    static func open(read: ReadAt, source: void*?, size: u64, parsed: const Parsed*) -> Feed!:
+        return Feed(read = read, source = source, size = size, parsed = parsed, block = try alloc u8[feed_block] in memory.heap,
+                    block_at = 0, block_length = 0, chunk = 0, offset = 0, crc = flate.crc32(b"IDAT"), base = 0, tail_length = 0,
+                    failed = false, failure_code = corrupt, failure = "")
+
+    mutating func close():
+        if self.block.length > 0:
+            free(self.block) in memory.heap
+        var empty: u8[]
+        self.block = empty
+
+    ## The file's bytes `at..<at + count` (at most a block), read into the block if not there.
+    mutating func bytes_at(at: u64, count: usize) -> const u8[]!:
+        if at < self.block_at or at + (u64)count > self.block_at + (u64)self.block_length:
+            let wanted = (u64)self.block.length if self.size - at > (u64)self.block.length else self.size - at
+            if (u64)count > wanted:
+                error(corrupt, "truncated PNG chunk")
+            self.block_at = at
+            self.block_length = 0
+            try read_exactly(self.read, self.source, at, self.block[..<(usize)wanted])
+            self.block_length = (usize)wanted
+        let origin = (usize)(at - self.block_at)
+        return self.block[origin..<origin + count]
+
+    ## The next piece of IDAT data; empty after the last chunk.
+    mutating func next() -> const u8[]!:
+        let p = self.parsed
+        # What the inflater may still need of the piece before goes to the tail.
+        self.keep_tail()
+        while self.chunk < p.count:
+            let current = p.pieces[self.chunk]
+            if self.offset == current.length:
+                let stored = try self.bytes_at((u64)(current.start + current.length), 4)
+                if (((u32)stored[0] << 24) | ((u32)stored[1] << 16) | ((u32)stored[2] << 8) | (u32)stored[3]) != self.crc:
+                    error(corrupt, "PNG CRC mismatch")
+                self.chunk += 1
+                self.offset = 0
+                self.crc = flate.crc32(b"IDAT")
+                continue
+            let at = (u64)(current.start + self.offset)
+            var count = current.length - self.offset
+            if at < self.block_at or at >= self.block_at + (u64)self.block_length:
+                discard(try self.bytes_at(at, 1))
+            let within = (usize)(self.block_at + (u64)self.block_length - at)
+            count = count if count < within else within
+            let piece = try self.bytes_at(at, count)
+            self.crc = flate.crc32(piece, self.crc)
+            self.offset += count
+            self.base += self.piece.length
+            self.piece = piece
+            return piece
+        self.base += self.piece.length
+        self.piece = self.block[..<0]
+        return self.piece
+
+    mutating func keep_tail():
+        let piece = self.piece
+        if piece.length >= 8:
+            memory.copy(self.tail, piece[piece.length - 8..], 8)
+            self.tail_length = 8
+            return
+        # A short piece: what the tail had moves up behind it.
+        let keep = 8 - piece.length if self.tail_length + piece.length > 8 else self.tail_length
+        var moved: u8[8]
+        memory.copy(moved, self.tail[self.tail_length - keep..<self.tail_length], keep)
+        memory.copy(moved[keep..], piece, piece.length)
+        memory.copy(self.tail, moved, keep + piece.length)
+        self.tail_length = keep + piece.length
+
+    ## Byte `offset` of the IDAT data joined, reading on as far as it is.
+    mutating func byte(offset: usize) -> u8!:
+        while offset >= self.base + self.piece.length:
+            if (try self.next()).length == 0:
+                error(corrupt, "truncated zlib stream")
+        if offset >= self.base:
+            return self.piece[offset - self.base]
+        if self.base - offset <= self.tail_length:
+            return self.tail[self.tail_length - (self.base - offset)]
+        error(corrupt, "truncated zlib stream")
+
+    ## Every chunk left read to its end, so its CRC is checked.
+    mutating func drain() -> !:
+        while (try self.next()).length > 0:
+            continue
+
+## `more` for a windowed inflate from a file.
+func feed_more(context: void*?) -> const u8[]:
+    let streamed = (Streamed*)(context else trap("a streamed decode has its state"))
+    let feed = streamed.feed else trap("a file decode has a feed")
+    return feed.next() catch failure:
+        feed.failed = true
+        feed.failure_code = failure.code
+        feed.failure = failure.message
+        recover feed.block[..<0]
+
+## Decode the `size`-byte PNG file `read` gives in bands of whole rows, each
+## handed to `sink` with `context`, as `decode_rows` does from memory.
+pub func decode_rows_at(read: ReadAt, source: void*?, size: u64, sink: RowSink, context: void*?, deep: bool = false, options: DecodeOptions = DecodeOptions()) -> !:
+    var parsed = try parse_at(read, source, size, options.max_bytes)
+    defer parsed.close()
+    let l = Layout.of(&parsed)
+    var target = Target(sink = sink, context = context, deep = deep)
+    let threads = worker_count(options.threads, parsed.info.width * parsed.info.height)
+    var total: usize = 0
+    for i in 0..<parsed.count:
+        total += parsed.pieces[i].length
+    if total > options.max_bytes:
+        error(limit, "PNG data exceeds byte limit")
+    if parsed.info.interlaced or parsed.pieces[0].length < 2:
+        # Adam7 fills the whole picture before any row is complete: from memory.
+        if size > (u64)options.max_bytes:
+            error(limit, "PNG file exceeds byte limit")
+        let whole = try alloc u8[(usize)size] in memory.heap
+        defer free(whole) in memory.heap
+        try read_exactly(read, source, 0, whole)
+        try decode_rows(whole, sink, context, deep, options)
+        return
+    var feed = try Feed.open(read, source, size, &parsed)
+    defer feed.close()
+    if try parallel_decode_at(&feed, &parsed, &l, &target, threads, options):
+        return
+    try streamed_rows_at(&feed, &parsed, &l, &target)
+
+## `streamed_rows` with the IDAT data from a file.
+func streamed_rows_at(feed: Feed*, p: const Parsed*, l: const Layout*, target: Target*) -> !:
+    let stride = l.row_bytes(l.width) + 1
+    let pixel: usize = 8 if target.deep else 4
+    let first = try feed.next()
+    if first.length < 2:
+        error(corrupt, "invalid zlib header")
+    try check_zlib_header(first)
+    let through = try alloc u8[streamed_window] in memory.heap
+    defer free(through) in memory.heap
+    let lines = try alloc u8[stride * 2] in memory.heap
+    defer free(lines) in memory.heap
+    let group = try alloc u8[streamed_group * l.width * pixel] in memory.heap
+    defer free(group) in memory.heap
+    target.bytes = group
+    target.first_row = 0
+    var streamed = Streamed(data = feed.block[..<0], parsed = p, next_piece = 1, layout = l, target = target, stride = stride, above = lines[..<stride], current = lines[stride..], filled = 0, row = 0, adler = 1, feed = feed)
+    let used = flate.inflate_raw_windowed(first[2..], through, stride * l.height, take_inflated, (void*)&streamed, feed_more) catch failure:
+        if feed.failed:
+            error(feed.failure_code, feed.failure)
+        error(failure.code, failure.message)
+    if feed.failed:
+        error(feed.failure_code, feed.failure)
+    var stored: u32 = 0
+    for index in 0..<(usize)4:
+        stored = (stored << 8) | (u32)(try feed.byte(2 + used + index))
+    if stored != streamed.adler:
+        error(corrupt, "zlib Adler checksum mismatch")
+    try feed.drain()
+
+## `parallel_decode` with the band chunks read from a file a group at a time;
+## false, having handed nothing on, to take the general path.
+func parallel_decode_at(feed: Feed*, p: const Parsed*, l: const Layout*, target: Target*, threads: usize, options: DecodeOptions) -> bool!:
+    let bands = p.bands
+    if bands < 2 or threads < 2 or p.count != bands + 2 or p.band_rows == 0:
+        return false
+    if p.band_rows * (bands - 1) >= l.height or p.band_rows * bands < l.height:
+        return false
+    if p.pieces[0].length != 2 or p.pieces[bands + 1].length != 4:
+        return false
+    let header = try feed.bytes_at((u64)p.pieces[0].start - 4, 10)
+    if not chunk_crc_ok(header, 0, 2):
+        error(corrupt, "PNG CRC mismatch")
+    if (header[4] & 15) != 8 or (((u32)header[4] << 8) | (u32)header[5]) % 31 != 0 or (header[5] & 32) != 0:
+        return false
+    let deliver = target.sink else trap("a file decode has a sink")
+    # The group's chunks as read, their data where the band tasks look for it.
+    var group = *p
+    group.pieces = try alloc Piece[p.count] in memory.heap
+    defer free(group.pieces) in memory.heap
+    let adlers = try new u32[bands] in memory.heap
+    defer free(adlers) in memory.heap
+    let pixel: usize = 8 if target.deep else 4
+    let per = threads * 2
+    let buffer = try alloc u8[per * p.band_rows * l.width * pixel] in memory.heap
+    defer free(buffer) in memory.heap
+    target.bytes = buffer
+    # The group's chunks lie one after another: one read a group, then their CRCs.
+    var longest: usize = 0
+    var band: usize = 0
+    while band < bands:
+        let length = group_bytes(p, band, per if band + per <= bands else bands - band)
+        longest = length if length > longest else longest
+        band += per
+    if longest > options.max_bytes:
+        error(limit, "PNG bands exceed byte limit")
+    let span = try alloc u8[longest] in memory.heap
+    defer free(span) in memory.heap
+    band = 0
+    while band < bands:
+        let count = per if band + per <= bands else bands - band
+        let origin = (u64)p.pieces[band + 1].start - 8
+        let length = group_bytes(p, band, count)
+        try read_exactly(feed.read, feed.source, origin, span[..<length])
+        for k in band + 1..<band + count + 1:
+            let at = (usize)((u64)p.pieces[k].start - origin)
+            if not chunk_crc_ok(span, at - 4, p.pieces[k].length):
+                error(corrupt, "PNG CRC mismatch")
+            group.pieces[k] = Piece(start = at, length = p.pieces[k].length)
+        var job = BandJob(data = span[..<length], parsed = &group, layout = l, target = target, first_band = band, adlers = adlers)
+        target.first_row = band * p.band_rows
+        try run_tasks(band_task, (void*)&job, count, threads)
+        if job.failed.load() != 0:
+            if band == 0:
+                return false
+            error(corrupt, "PNG band does not decode")
+        let first = band * p.band_rows
+        let end = first + count * p.band_rows if first + count * p.band_rows < l.height else l.height
+        try deliver(target.context, first, end - first, buffer[..<(end - first) * l.width * pixel])
+        band += count
+    let stride = l.row_bytes(l.width) + 1
+    var adler = adlers[0]
+    for b in 1..<bands:
+        let rows = p.band_rows if (b + 1) * p.band_rows <= l.height else l.height - b * p.band_rows
+        adler = flate.adler32_combine(adler, adlers[b], rows * stride)
+    let tail = try feed.bytes_at((u64)p.pieces[bands + 1].start - 4, 12)
+    if not chunk_crc_ok(tail, 0, 4):
+        error(corrupt, "PNG CRC mismatch")
+    let stored = ((u32)tail[4] << 24) | ((u32)tail[5] << 16) | ((u32)tail[6] << 8) | (u32)tail[7]
+    if stored != adler:
+        error(corrupt, "zlib Adler checksum mismatch")
+    return true
+
+## Bytes of the file from the header of band `band`'s chunk through the CRC of
+## band `band + count - 1`'s.
+func group_bytes(p: const Parsed*, band: usize, count: usize) -> usize:
+    let last = p.pieces[band + count]
+    return last.start + last.length + 4 - (p.pieces[band + 1].start - 8)

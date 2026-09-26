@@ -1,7 +1,7 @@
 ## The gate's driver.
-## `tool decode <in.png> <out.raw> <rgba8|rgba16|rows8|rows16> [threads]` writes a
+## `tool decode <in.png> <out.raw> <rgba8|rgba16|rows8|rows16|at8|at16> [threads]` writes a
 ## 12-byte header (width, height, bytes a pixel) and the pixels (16-bit samples
-## little-endian).
+## little-endian); `at` modes read the file in pieces through `decode_rows_at`.
 ## `tool encode <in.png> <out.png> <level> <filter> <gray8|ga8|rgb8|rgba8|gray16|ga16|rgb16|rgba16>
 ## <whole|stream> [threads] [band rows]` encodes the input's pixels in that format.
 import files
@@ -23,6 +23,12 @@ func collect(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !
     collected.next_row = first + rows
     try collected.out.put(bytes)
 
+## `ReadAt` over an open file.
+func read_file(context: void*?, at: u64, into: u8[]) -> usize!:
+    let file = (files.File*)(context else return 0)
+    discard(try file.seek((i64)at))
+    return try file.read(into)
+
 func number(arguments: str[], index: usize, fallback: u64) -> u64:
     if arguments.length <= index:
         return fallback
@@ -36,13 +42,21 @@ pub func main(arguments: str[]) -> i32!:
     if arguments[1] == "decode":
         let mode = arguments[4]
         let options = png.DecodeOptions(threads = (usize)number(arguments, 5, 0))
-        let deep = mode == "rgba16" or mode == "rows16"
+        let deep = mode == "rgba16" or mode == "rows16" or mode == "at16"
         var raw = Buffer()
         defer raw.close()
         try raw.uint((u64)w, 4)
         try raw.uint((u64)h, 4)
         try raw.uint(8 if deep else 4, 4)
-        if mode == "rows8" or mode == "rows16":
+        if mode == "at8" or mode == "at16":
+            var file = try files.File.open((c.str)arguments[2])
+            defer file.destroy()
+            var collected = Collected(out = &raw, next_row = 0, failed = false)
+            try png.decode_rows_at(read_file, (void*)&file, (u64)data.length, collect, (void*)&collected, deep = deep, options = options)
+            if collected.failed or collected.next_row != h:
+                print("rows out of order or missing")
+                return 1
+        elif mode == "rows8" or mode == "rows16":
             var collected = Collected(out = &raw, next_row = 0, failed = false)
             try png.decode_rows(data, collect, (void*)&collected, deep = deep, options = options)
             if collected.failed or collected.next_row != h:

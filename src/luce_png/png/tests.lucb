@@ -167,3 +167,108 @@ test "a PNG from another encoder streams its rows through an inflate window":
         failed = failure.code == corrupt
         recover ()
     assert(failed)
+
+## A file in memory read through `ReadAt`, counting the most read at once.
+struct Held:
+    var data: const u8[]
+    var reads: usize
+    var largest: usize
+
+func read_held(context: void*?, at: u64, into: u8[]) -> usize!:
+    let held = (Held*)(context else return 0)
+    if at >= (u64)held.data.length:
+        return 0
+    let count = into.length if (usize)at + into.length <= held.data.length else held.data.length - (usize)at
+    memory.copy(into, held.data[(usize)at..], count)
+    held.reads += 1
+    held.largest = count if count > held.largest else held.largest
+    return count
+
+## `data` decoded through `decode_rows_at` as `decode_rows` decodes it; whether the rows agree.
+func same_rows_at(data: const u8[], width: usize, height: usize, deep: bool) -> bool!:
+    let pixel: usize = 8 if deep else 4
+    var expected = Collected(pixels = try alloc u8[width * height * pixel] in memory.heap, next = 0, calls = 0)
+    defer free(expected.pixels) in memory.heap
+    try decode_rows(data, collect, (void*)&expected, deep)
+    var rows = Collected(pixels = try alloc u8[width * height * pixel] in memory.heap, next = 0, calls = 0)
+    defer free(rows.pixels) in memory.heap
+    var held = Held(data = data, reads = 0, largest = 0)
+    try decode_rows_at(read_held, (void*)&held, (u64)data.length, collect, (void*)&rows, deep)
+    if rows.next != height:
+        return false
+    for i in 0..<expected.pixels.length:
+        if rows.pixels[i] != expected.pixels[i]:
+            return false
+    return true
+
+test "a file read in pieces decodes as the file whole, its banded and general paths":
+    # Noise over 2 MB of IDAT data, in chunks of 7000 bytes as other encoders
+    # write them, so pieces cross the reads' blocks and the chunks' ends.
+    let width: usize = 900
+    let height: usize = 700
+    let stride = width * 4 + 1
+    let raw = try alloc u8[stride * height] in memory.heap
+    defer free(raw) in memory.heap
+    var seed: u32 = 12345
+    for y in 0..<height:
+        raw[y * stride] = (u8)(y % 5)
+        for x in 1..<stride:
+            seed = seed *% 1103515245 +% 12345
+            raw[y * stride + x] = (u8)(seed >> 24)
+    let packed = try alloc u8[raw.length + 65536] in memory.heap
+    defer free(packed) in memory.heap
+    let used = try flate.deflate_zlib(raw, 1, packed)
+    var out = Buffer()
+    defer out.close()
+    try out.put(signature)
+    var header: u8[13]
+    put32(&header[0], (u32)width)
+    put32(&header[4], (u32)height)
+    header[8] = 8
+    header[9] = 6
+    try chunk(&out, "IHDR", header)
+    try chunk(&out, "tEXt", b"Comment\x00in pieces")
+    var at: usize = 0
+    while at < used:
+        let end = at + 7000 if at + 7000 < used else used
+        try chunk(&out, "IDAT", packed[at..<end])
+        at = end
+    try chunk(&out, "IEND", b"")
+    assert(try same_rows_at(out.view(), width, height, false))
+    assert(try same_rows_at(out.view(), width, height, true))
+    # This encoder's bands, decoded a group at a time on every processor.
+    let pixels = try alloc u8[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    for i in 0..<pixels.length:
+        pixels[i] = raw[(i // (width * 4)) * stride + 1 + i % (width * 4)]
+    var banded = Buffer()
+    defer banded.close()
+    try encode_rgba8(pixels, width, height, &banded, EncodeOptions(level = 1, band_rows = 16))
+    assert(try same_rows_at(banded.view(), width, height, false))
+    # A damaged IDAT chunk, one in the middle, fails on its CRC.
+    let damaged = try alloc u8[out.view().length] in memory.heap
+    defer free(damaged) in memory.heap
+    memory.copy(damaged, out.view(), damaged.length)
+    damaged[damaged.length // 2] ^= 1
+    var rows = Collected(pixels = try alloc u8[width * height * 4] in memory.heap, next = 0, calls = 0)
+    defer free(rows.pixels) in memory.heap
+    var held = Held(data = damaged, reads = 0, largest = 0)
+    var failed = false
+    decode_rows_at(read_held, (void*)&held, (u64)damaged.length, collect, (void*)&rows) catch failure:
+        failed = failure.code == corrupt
+        recover ()
+    assert(failed)
+    # A file cut short fails too, and every cut is a clean failure.
+    for cut in [(usize)7, 40, damaged.length // 3, damaged.length - 5]:
+        var short = Held(data = out.view()[..<cut], reads = 0, largest = 0)
+        rows.next = 0
+        failed = false
+        decode_rows_at(read_held, (void*)&short, (u64)cut, collect, (void*)&rows) catch failure:
+            failed = true
+            recover ()
+        assert(failed)
+    # The reads stay a block at most.
+    rows.next = 0
+    held = Held(data = out.view(), reads = 0, largest = 0)
+    try decode_rows_at(read_held, (void*)&held, (u64)out.view().length, collect, (void*)&rows)
+    assert(held.largest <= feed_block and held.reads > 2)

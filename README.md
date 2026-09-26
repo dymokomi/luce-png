@@ -13,6 +13,7 @@ let found = try png.info(data)                        # size, bits, colour type,
 try png.decode_rgba8(data, pixels)                    # w * h * 4 bytes; 16-bit rounds to 8
 try png.decode_rgba16(data, samples)                  # w * h * 4 u16; 8-bit scales by 257
 try png.decode_rows(data, sink, (void*)&state, deep = false)   # bands of RGBA rows, in order
+try png.decode_rows_at(read, (void*)&file, size, sink, (void*)&state)   # the same, the file read in pieces
 
 try png.probe(&raster)                                # the Raster route, as before
 try raster.allocate()
@@ -20,6 +21,8 @@ try png.decode(&raster)
 ```
 
 Every colour type and depth, palettes, tRNS and Adam7. PNGs this encoder wrote decode band by band on every processor (see below); any other PNG inflates on the calling thread while up to seven threads unfilter the rows behind it in a wavefront (each row a few kilobytes behind the one above) and another checks the Adler-32.
+
+`decode_rows_at` never holds the file: `read(context, offset, buffer)` gives its bytes. The chunks are walked in place, then the IDAT data is read a megabyte block at a time into the inflate window (banded files a group of bands at a time, decoded on every processor), each chunk's CRC checked as it goes. Interlaced files, whose rows complete only at the last pass, are read whole.
 
 ## Encoding
 
