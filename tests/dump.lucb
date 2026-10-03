@@ -1,7 +1,7 @@
 ## Decodes one PNG through the Raster API and writes its samples: `dump <in.png>
 ## <out.raw>`, a 12-byte header (width, height, channels as little-endian u32) then
 ## each sample as a little-endian u16.
-import luce_std.files
+from luce_std import files
 import c
 import png
 from luce_raster.model import Raster

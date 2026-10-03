@@ -5,7 +5,7 @@
 ## `coarse` writes an interlaced picture's first sight (Adam7's first pass) instead.
 ## `tool encode <in.png> <out.png> <level> <filter> <gray8|ga8|rgb8|rgba8|gray16|ga16|rgb16|rgba16>
 ## <whole|stream> [threads] [band rows]` encodes the input's pixels in that format.
-import luce_std.files
+from luce_std import files
 import c
 import memory
 import strings

@@ -1,7 +1,7 @@
 ## Times PNG decoding and encoding: `bench <file.png> <out.png> [repeats] [level]
 ## [raster] [threads]`. Decodes to RGBA8 (or a Raster), then encodes that; the
 ## last encoding is written out.
-import luce_std.files
+from luce_std import files
 import c
 import time
 import memory

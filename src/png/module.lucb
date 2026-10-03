@@ -31,11 +31,11 @@
 #
 #==============================================================================================
 import memory
-import luce_std.math
+from luce_std import math
 import thread
 import os
 import sync
-import luce_compress.flate
+from luce_compress import flate
 from luce_raster.binary import Reader, Buffer
 from luce_raster.model import Raster, SampleType
 from luce_raster.errors import corrupt, unsupported, invalid, limit
