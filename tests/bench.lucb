@@ -1,14 +1,14 @@
 ## Times PNG decoding and encoding: `bench <file.png> <out.png> [repeats] [level]
 ## [raster] [threads]`. Decodes to RGBA8 (or a Raster), then encodes that; the
 ## last encoding is written out.
-import files
+import luce_std.files
 import c
 import time
 import memory
 import strings
 import png
-from raster import Raster
-from binary import Buffer
+from luce_raster.model import Raster
+from luce_raster.binary import Buffer
 
 func number(arguments: str[], index: usize, fallback: u64) -> u64:
     if arguments.length <= index:

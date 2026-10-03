@@ -31,14 +31,14 @@
 #
 #==============================================================================================
 import memory
-import math
+import luce_std.math
 import thread
 import os
 import sync
-import flate
-from binary import Reader, Buffer
-from raster import Raster, SampleType
-from raster_errors import corrupt, unsupported, invalid, limit
+import luce_compress.flate
+from luce_raster.binary import Reader, Buffer
+from luce_raster.model import Raster, SampleType
+from luce_raster.errors import corrupt, unsupported, invalid, limit
 
 let signature = b"\x89PNG\r\n\x1a\n"
 

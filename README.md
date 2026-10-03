@@ -7,7 +7,7 @@ Split out of luce-image on 2026-09-22 so every file format is its own package, l
 ## Decoding
 
 ```luce
-import png
+import luce_png.png
 
 let found = try png.info(data)                        # size, bits, colour type, interlace, alpha
 try png.decode_rgba8(data, pixels)                    # w * h * 4 bytes; 16-bit rounds to 8

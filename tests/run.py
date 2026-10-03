@@ -194,7 +194,7 @@ def check_damage(tmp, dump, tool):
 
 
 for flags in MODES:
-    run([BASE, "test", ROOT / "src/luce_png/png", *flags], check=True)
+    run([BASE, "test", ROOT / "src/png", *flags], check=True)
     with tempfile.TemporaryDirectory(prefix="luce-png-") as name:
         tmp = Path(name)
         dump, tool = tmp / "dump", tmp / "tool"

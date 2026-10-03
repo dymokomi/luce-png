@@ -1,11 +1,11 @@
 ## Decodes one PNG through the Raster API and writes its samples: `dump <in.png>
 ## <out.raw>`, a 12-byte header (width, height, channels as little-endian u32) then
 ## each sample as a little-endian u16.
-import files
+import luce_std.files
 import c
 import png
-from raster import Raster
-from binary import Buffer
+from luce_raster.model import Raster
+from luce_raster.binary import Buffer
 
 pub func main(arguments: str[]) -> i32!:
     var raster = Raster()
