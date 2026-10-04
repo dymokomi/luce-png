@@ -16,7 +16,12 @@ func number(arguments: str[], index: usize, fallback: u64) -> u64:
     return strings.parse_u64(arguments[index]) else fallback
 
 pub func main(arguments: str[]) -> i32!:
-    let encoded = try files.read((c.str)arguments[1])
+    let file = try files.read((c.str)arguments[1])
+    defer file.release()
+    # A raster holds mutable bytes, so the benchmark lends it a copy.
+    let encoded = try alloc u8[file.value.length] in memory.heap
+    defer free(encoded) in memory.heap
+    memory.copy(encoded, file.value, file.value.length)
     let repeats = (usize)number(arguments, 3, 1)
     let level = (i32)number(arguments, 4, 6)
     let raster_mode = arguments.length > 5 and arguments[5] == "raster"

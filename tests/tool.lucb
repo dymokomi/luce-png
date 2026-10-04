@@ -52,7 +52,9 @@ func number(arguments: str[], index: usize, fallback: u64) -> u64:
     return strings.parse_u64(arguments[index]) else fallback
 
 pub func main(arguments: str[]) -> i32!:
-    let data = try files.read((c.str)arguments[2])
+    let data_file = try files.read((c.str)arguments[2])
+    defer data_file.release()
+    let data = data_file.value
     let info = try png.info(data)
     let w = info.width
     let h = info.height

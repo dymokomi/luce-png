@@ -3,6 +3,7 @@
 ## each sample as a little-endian u16.
 from luce_std import files
 import c
+import memory
 import png
 from luce_raster.model import Raster
 from luce_raster.binary import Buffer
@@ -10,7 +11,11 @@ from luce_raster.binary import Buffer
 pub func main(arguments: str[]) -> i32!:
     var raster = Raster()
     defer raster.close()
-    raster.encoded = try files.read((c.str)arguments[1])
+    let file = try files.read((c.str)arguments[1])
+    defer file.release()
+    # The raster frees its bytes on the heap, so it keeps a copy of them.
+    raster.encoded = try alloc u8[file.value.length] in memory.heap
+    memory.copy(raster.encoded, file.value, file.value.length)
     try png.probe(&raster)
     try raster.allocate()
     try png.decode(&raster)
