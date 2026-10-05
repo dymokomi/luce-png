@@ -1,0 +1,196 @@
+#==============================================================================================
+#
+#   png/color - The colour chunks: cICP, iCCP, sRGB, gAMA and cHRM
+#
+#   DESCRIPTION:
+#       What a PNG says about its colours, read as libpng 1.6.50 reads it (the libpng
+#       Ladybird decodes PNGs with): each chunk only before PLTE and IDAT, at most once, at
+#       its length, else ignored (libpng's benign errors); an sRGB intent above 3 and a gAMA
+#       above 2^31 - 1 are ignored too, and so is an iCCP chunk shorter than 92 bytes
+#       (png_handle_iCCP's "too short"). The iCCP profile is inflated on request
+#       (`icc_profile`), as far as its declared length (libpng stops there, so it never
+#       checks the Adler-32), and checked as png_handle_iCCP checks it: its length (at
+#       least 132 bytes, at most libpng's 8 000 000 byte chunk limit), its header (length,
+#       tag count, rendering intent, 'acsp', a data colour space of RGB for a colour image
+#       and GRAY for a gray one, a profile class that may be embedded, an XYZ or Lab
+#       connection space) and its tag table (every tag inside the profile). A profile that
+#       fails is ignored, as libpng ignores it.
+#
+#       Which chunk wins is the reader's to say. PNG 3 orders them cICP, iCCP, sRGB, gAMA
+#       and cHRM; Ladybird's PNGLoader takes cICP, else iCCP, and reads none of the others.
+#
+#==============================================================================================
+
+## A cICP chunk: ITU-T H.273 code points.
+pub struct Cicp:
+    pub var color_primaries: u8
+    pub var transfer_function: u8
+    pub var matrix_coefficients: u8
+    pub var video_full_range: u8
+
+## A cHRM chunk: the white point and primaries, xy times 100 000.
+pub struct Chromaticities:
+    pub var white_x: u32
+    pub var white_y: u32
+    pub var red_x: u32
+    pub var red_y: u32
+    pub var green_x: u32
+    pub var green_y: u32
+    pub var blue_x: u32
+    pub var blue_y: u32
+
+## The colour chunks of a PNG.
+pub struct Colorimetry:
+    pub var cicp: Cicp?
+    ## iCCP: whether there is one, its profile name (Latin-1, 1 to 79 bytes), and the zlib
+    ## stream of the profile, within the file; `icc_profile` inflates and checks it.
+    pub var has_icc: bool
+    pub var icc_name: const u8[]
+    pub var icc_stream: const u8[]
+    ## sRGB: the rendering intent, 0 to 3.
+    pub var srgb_intent: u8?
+    ## gAMA: the image gamma times 100 000.
+    pub var gamma: u32?
+    pub var chromaticities: Chromaticities?
+
+## libpng's chunk size limit (PNG_USER_CHUNK_MALLOC_MAX), which bounds a profile.
+let icc_profile_limit: usize = 8000000
+
+## The keyword, separator, method byte and smallest zlib stream of an iCCP chunk (LKMin).
+let icc_chunk_minimum: usize = 14
+
+func read_u32(data: const u8[], at: usize) -> u32:
+    return ((u32)data[at] << 24) | ((u32)data[at + 1] << 16) | ((u32)data[at + 2] << 8) | (u32)data[at + 3]
+
+## A colour chunk named `name`, `body` its data: taken into `result` when libpng would
+## accept it, else ignored.
+func take_color_chunk(result: Parsed*, walk: const Walk*, name: str, body: const u8[]):
+    # Before PLTE and IDAT (libpng's hCOL), after IHDR.
+    if walk.pixels or result.palette.length != 0:
+        return
+    let c = &result.info.colorimetry
+    if name == "cICP":
+        if c.cicp != none or body.length != 4:
+            return
+        c.cicp = Cicp(color_primaries = body[0], transfer_function = body[1], matrix_coefficients = body[2], video_full_range = body[3])
+    elif name == "iCCP":
+        if c.has_icc or body.length < icc_chunk_minimum:
+            return
+        # png_handle_iCCP reads the keyword with up to 81 bytes and wants the minimal
+        # zlib stream after those, so a chunk shorter than 92 bytes is "too short".
+        let read_length: usize = 81 if body.length > 81 else body.length
+        if body.length - read_length < 11:
+            return
+        # The keyword: 1 to 79 bytes before a NUL, then compression method 0 (deflate).
+        var keyword_length: usize = 0
+        while keyword_length < 80 and keyword_length < read_length and body[keyword_length] != 0:
+            keyword_length += 1
+        if keyword_length < 1 or keyword_length > 79 or keyword_length + 1 >= read_length or body[keyword_length + 1] != 0:
+            return
+        c.has_icc = true
+        c.icc_name = body[..<keyword_length]
+        c.icc_stream = body[keyword_length + 2..]
+    elif name == "sRGB":
+        if c.srgb_intent != none or body.length != 1 or body[0] > 3:
+            return
+        c.srgb_intent = body[0]
+    elif name == "gAMA":
+        if c.gamma != none or body.length != 4:
+            return
+        let gamma = read_u32(body, 0)
+        if gamma > 0x7fffffff:
+            return
+        c.gamma = gamma
+    elif name == "cHRM":
+        if c.chromaticities != none or body.length != 32:
+            return
+        # png_get_int_32_checked: each value a non-negative 31-bit number.
+        for i in 0..<(usize)8:
+            if read_u32(body, i * 4) > 0x7fffffff:
+                return
+        c.chromaticities = Chromaticities(white_x = read_u32(body, 0), white_y = read_u32(body, 4), red_x = read_u32(body, 8), red_y = read_u32(body, 12), green_x = read_u32(body, 16), green_y = read_u32(body, 20), blue_x = read_u32(body, 24), blue_y = read_u32(body, 28))
+
+# mark: The ICC profile ========================================================================
+
+## The first `output.length` bytes the raw DEFLATE stream `data` inflates to, as libpng's
+## png_inflate_read stops once its buffer is full: how many it made (fewer when the stream
+## ends first), or none when the stream is corrupt before then. The Adler-32 after the
+## stream is never reached, so never checked, as in libpng.
+func inflate_prefix(data: const u8[], output: u8[]) -> usize?:
+    var full = false
+    let (used, produced) = flate.inflate_raw_bounded(data, output) catch failure:
+        # The stream goes on past the buffer: the buffer is full.
+        if failure.message == "deflate stream is longer than its output":
+            full = true
+        recover (0, 0)
+    _ = used
+    if full:
+        return output.length
+    if produced == 0 and output.length > 0:
+        return none
+    return produced
+
+## The iCCP profile of the PNG `found` was read from, inflated and checked as libpng checks
+## it, in a buffer of the current allocator the caller frees; none without an iCCP chunk or
+## when libpng would ignore it.
+pub func icc_profile(found: const Info*) -> u8[]?!:
+    let c = &found.colorimetry
+    if not c.has_icc:
+        return none
+    let stream = c.icc_stream
+    if stream.length < 2 or (stream[0] & 15) != 8 or stream[0] >> 4 > 7 or (((u32)stream[0] << 8) | (u32)stream[1]) % 31 != 0 or (stream[1] & 32) != 0:
+        return none
+
+    # The header first; a zlib error or a short stream ignores the profile.
+    var header: u8[132] = ---
+    let got = inflate_prefix(stream[2..], header) else return none
+    if got < 132:
+        return none
+
+    # png_icc_check_length and png_icc_check_header.
+    let profile_length = (usize)read_u32(header, 0)
+    if profile_length < 132 or profile_length > icc_profile_limit:
+        return none
+    if header[8] > 3 and (profile_length & 3) != 0:
+        return none
+    let tag_count = (usize)read_u32(header, 128)
+    if tag_count > 357913930 or profile_length < 132 + 12 * tag_count:
+        return none
+    if read_u32(header, 64) >= 0xffff:
+        return none
+    if read_u32(header, 36) != 0x61637370:
+        return none
+    let colour = found.color == 2 or found.color == 3 or found.color == 6
+    let space = read_u32(header, 16)
+    if space == 0x52474220:
+        if not colour:
+            return none
+    elif space == 0x47524159:
+        if colour:
+            return none
+    else:
+        return none
+    let profile_class = read_u32(header, 12)
+    if profile_class == 0x61627374 or profile_class == 0x6c696e6b:
+        # Abstract and DeviceLink profiles may not be embedded in an image.
+        return none
+    let pcs = read_u32(header, 20)
+    if pcs != 0x58595a20 and pcs != 0x4c616220:
+        return none
+
+    # Then the whole profile (more is libpng's "extra compressed data", a warning).
+    let profile = try new u8[profile_length] ---
+    let whole = inflate_prefix(stream[2..], profile) else 0
+    var ok = whole == profile_length
+    # png_icc_check_tag_table: every tag inside the profile.
+    var i: usize = 0
+    while ok and i < tag_count:
+        let tag_start = (usize)read_u32(profile, 132 + 12 * i + 4)
+        let tag_length = (usize)read_u32(profile, 132 + 12 * i + 8)
+        if tag_start > profile_length or tag_length > profile_length - tag_start:
+            ok = false
+        i += 1
+    if not ok:
+        free(profile)
+        return none
+    return profile

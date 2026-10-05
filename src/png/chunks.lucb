@@ -182,6 +182,8 @@ func take_chunk(result: Parsed*, walk: Walk*, name: str, body: const u8[], start
         if size == 9 and body[0] == 1:
             result.band_rows = (usize)(((u32)body[1] << 24) | ((u32)body[2] << 16) | ((u32)body[3] << 8) | (u32)body[4])
             result.bands = (usize)(((u32)body[5] << 24) | ((u32)body[6] << 16) | ((u32)body[7] << 8) | (u32)body[8])
+    elif name == "cICP" or name == "iCCP" or name == "sRGB" or name == "gAMA" or name == "cHRM":
+        take_color_chunk(result, walk, name, body)
     elif name == "acTL":
         error(unsupported, "APNG animation is not supported")
     elif (name.bytes[0] & 32) == 0:

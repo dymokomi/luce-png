@@ -311,3 +311,57 @@ test "the start of a file up to its first IDAT probes as the file whole":
     try probe_head(&head)
     assert(head.width == 4 and head.height == 2 and head.channels.length == whole.channels.length and head.photo == 3)
     assert((str)head.palette == (str)whole.palette and (str)head.transparency == (str)whole.transparency)
+
+# mark: Colour chunks ==========================================================================
+from luce_std import files
+import c as libc
+import strings
+
+## The bytes of tests/fixtures/color/NAME, kept in the heap for the run (tests run from the
+## repository root).
+func color_fixture(name: str) -> const u8[]:
+    var buffer: u8[256]
+    let path = strings.format(buffer, f"tests/fixtures/color/{name}") else trap("a fixture path is too long")
+    with memory.heap:
+        return (files.read((libc.str)path) else trap("cannot read a colour fixture")).value
+
+test "colour chunks are read as libpng reads them":
+    let both = try info(color_fixture("cicp-iccp.png"))
+    let cicp = both.colorimetry.cicp else trap("cICP is read")
+    assert(cicp.color_primaries == 12 and cicp.transfer_function == 13 and cicp.matrix_coefficients == 0 and cicp.video_full_range == 1)
+    assert(both.colorimetry.has_icc and (str)both.colorimetry.icc_name == "also")
+    let profile = with_profile(&both)
+    assert((str)profile == (str)color_fixture("cicp-iccp.icc"))
+    let tagged = try info(color_fixture("gama-chrm-srgb.png"))
+    assert(tagged.colorimetry.srgb_intent == 1 and tagged.colorimetry.gamma == 45455 and not tagged.colorimetry.has_icc)
+    let white = tagged.colorimetry.chromaticities else trap("cHRM is read")
+    assert(white.white_x == 31270 and white.blue_y == 6000)
+    # Out of range, out of place, too short or repeated chunks are ignored.
+    let ignored = try info(color_fixture("color-invalid.png"))
+    assert(ignored.colorimetry.srgb_intent == none and ignored.colorimetry.gamma == none and ignored.colorimetry.cicp == none)
+    let late = try info(color_fixture("iccp-after-plte.png"))
+    assert(not late.colorimetry.has_icc and late.colorimetry.gamma == none)
+    let small = try info(color_fixture("gray-iccp.png"))
+    assert(not small.colorimetry.has_icc)
+    let two = try info(color_fixture("two-iccp.png"))
+    assert((str)with_profile(&two) == (str)color_fixture("two-iccp.icc"))
+
+test "an ICC profile libpng refuses is none":
+    let names: str[6] = ["rgb-gray-profile.png", "gray-rgb-profile.png", "iccp-abstract.png", "iccp-truncated.png", "iccp-no-keyword.png", "wpt-cicp-and-iccp.png"]
+    for name in names:
+        let found = try info(color_fixture(name))
+        var profile: u8[]? = none
+        with memory.heap:
+            profile = try icc_profile(&found)
+        assert(profile == none)
+    # libpng stops at the declared length: trailing data, and a damaged Adler-32, are kept.
+    let longer = try info(color_fixture("iccp-extra-data.png"))
+    assert((str)with_profile(&longer) == (str)color_fixture("iccp-extra-data.icc"))
+    let swap = try info(color_fixture("wpt-swap-990000-iccp.png"))
+    assert((str)with_profile(&swap) == (str)color_fixture("wpt-swap-990000-iccp.icc"))
+
+## The profile of `found`, kept in the heap for the run.
+func with_profile(found: const Info*) -> const u8[]:
+    with memory.heap:
+        let profile = icc_profile(found) else trap("the profile inflates")
+        return profile else trap("there is a profile")

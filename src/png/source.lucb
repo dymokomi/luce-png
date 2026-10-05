@@ -80,6 +80,10 @@ func take_read_chunk(read: ReadAt, source: void*?, at: u64, length: usize, resul
         memory.copy(kept, body, length)
         body = kept[..<length]
     try take_chunk(result, walk, name, body, (usize)at + 4, length)
+    # The rows are what this path decodes: an iCCP chunk's bytes are not kept.
+    var empty: const u8[]
+    result.info.colorimetry.icc_name = empty
+    result.info.colorimetry.icc_stream = empty
 
 ## The IDAT data of a parsed file handed on a piece at a time, as a windowed
 ## inflate asks for it: each piece is the part of a chunk's data in the block

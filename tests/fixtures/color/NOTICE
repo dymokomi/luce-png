@@ -1,0 +1,17 @@
+PNGs with colour chunks for png/color's tests (src/png/tests.lucb, tests/run.py).
+
+Written by tests/make_color_fixtures.py (no third-party data): every file here not named
+below, with NAME.icc the profile libpng inflates from NAME.png's iCCP chunk.
+
+From the web-platform-tests (as imported by Ladybird's Tests/LibWeb; 3-Clause BSD License,
+LICENSE-wpt.md):
+  wpt-swap-990000-iccp.png   css/css-color/support/swap-990000-iCCP.png
+  wpt-cicp-and-iccp.png      png/support/cICP-and-iCCP.png (its profile is cut short)
+  wpt-009900-srgb.png        css/css-color/support/009900-sRGB.png
+and the profiles inflated from them (.icc beside).
+
+From Ladybird (Tests/LibGfx/test-inputs/icc/icc-v2.png; BSD 2-Clause License,
+LICENSE-ladybird): ladybird-icc-v2.png and its profile.
+
+expected.txt is what libpng 1.6.50 (Ladybird's, through its vcpkg tree) reads from each PNG:
+luce-browser-tools/oracles/luce-png/color/libpng_oracle.

@@ -1,0 +1,73 @@
+## The colour chunks luce-png reads from PNGs, printed as the libpng oracle prints them
+## (luce-browser-tools/oracles/luce-png/color): `color_tool FILE...`, one line a file,
+## `NAME cicp=P,T,M,F|- icc=LENGTH:FNV1A|- srgb=I|- gama=G|- chrm=W...|-`.
+from luce_std import files
+import c
+import memory
+import strings
+import png
+
+## The line being written.
+struct Line:
+    var bytes: u8[1024]
+    var used: usize
+
+    func add(text: fmt):
+        var scratch: u8[256]
+        let piece = strings.format(scratch, text) else trap("a piece of the line is too long")
+        for b in piece.bytes:
+            self.bytes[self.used] = b
+            self.used += 1
+
+## FNV-1a of `data`.
+func fnv(data: const u8[]) -> u32:
+    var h: u32 = 2166136261
+    for b in data:
+        h = (h ^ (u32)b) *% 16777619
+    return h
+
+func name_of(path: str) -> str:
+    let bytes = path.bytes
+    var start: usize = 0
+    for i in 0..<bytes.length:
+        if bytes[i] == '/':
+            start = i + 1
+    return (str)bytes[start..]
+
+func show(path: str) -> !:
+    let read = try files.read((c.str)path)
+    defer read.release()
+    let found = try png.info(read.value)
+    let colors = found.colorimetry
+    var line = Line()
+    line.add(name_of(path))
+    if let cicp = colors.cicp:
+        line.add(f" cicp={cicp.color_primaries},{cicp.transfer_function},{cicp.matrix_coefficients},{cicp.video_full_range}")
+    else:
+        line.add(" cicp=-")
+    var profile: u8[]? = none
+    with memory.heap:
+        profile = try png.icc_profile(&found)
+    if let bytes = profile:
+        line.add(f" icc={bytes.length}:{fnv(bytes):08x}")
+        free(bytes) in memory.heap
+    else:
+        line.add(" icc=-")
+    if let intent = colors.srgb_intent:
+        line.add(f" srgb={intent}")
+    else:
+        line.add(" srgb=-")
+    if let gamma = colors.gamma:
+        line.add(f" gama={gamma}")
+    else:
+        line.add(" gama=-")
+    if let w = colors.chromaticities:
+        line.add(f" chrm={w.white_x},{w.white_y},{w.red_x},{w.red_y},{w.green_x},{w.green_y},{w.blue_x},{w.blue_y}")
+    else:
+        line.add(" chrm=-")
+    print((str)line.bytes[..<line.used])
+
+pub func main(arguments: str[]) -> i32!:
+    for i in 1..<arguments.length:
+        try show(arguments[i])
+    return 0

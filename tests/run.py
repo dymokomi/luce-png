@@ -9,7 +9,9 @@
 - the encoder is lossless in every format, gives the same bytes on one thread, on
   all and streamed, at every level and filter, in one band or many; its files
   decode the same here in parallel and sequentially and (with Pillow) in libpng;
-- truncated and corrupted files fail cleanly, never crash or hang.
+- truncated and corrupted files fail cleanly, never crash or hang;
+- the colour chunks of tests/fixtures/color (cICP, iCCP and its profile, sRGB, gAMA, cHRM)
+  read as libpng 1.6.50 reads them (expected.txt, from the libpng oracle).
 """
 import hashlib, os, random, struct, subprocess, tempfile
 from pathlib import Path
@@ -17,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BASE = Path(os.environ.get("LUCE_BASE", ROOT.parent / "luce-base/build/luce-base")).resolve()
 MODES = [["--native"], ["--backend=c"]]
-env = dict(os.environ, LUCE_BASE=str(BASE), LUCE_STD=str((ROOT.parent / "luce-base/src/std").resolve()))
+env = dict(os.environ, LUCE_BASE=str(BASE), LUCE_STD=os.environ.get("LUCE_STD", str((ROOT.parent / "luce-base/src/std").resolve())))
 FIXTURES = sorted((ROOT / "tests/fixtures").glob("*.png"))
 GOLDEN = {}
 for line in (ROOT / "tests/fixtures/golden.txt").read_text().splitlines():
@@ -193,6 +195,17 @@ def check_damage(tmp, dump, tool):
     print(f"ok    {damaged} decodes of damaged files ended cleanly")
 
 
+def check_color(tmp, flags):
+    tool = tmp / "color_tool"
+    run([BASE, "build", ROOT / "tests/color_tool.lucb", *flags, "-o", tool], check=True)
+    folder = ROOT / "tests/fixtures/color"
+    names = sorted(p.name for p in folder.glob("*.png"))
+    found = subprocess.run([str(tool), *names], cwd=folder, env=env, capture_output=True, timeout=300, check=True).stdout.decode()
+    if found != (folder / "expected.txt").read_text():
+        fail("the colour chunks differ from libpng's (tests/fixtures/color/expected.txt)")
+    print(f"ok    {len(names)} PNGs' colour chunks as libpng reads them")
+
+
 for flags in MODES:
     run([BASE, "test", ROOT / "src/png", *flags], check=True)
     with tempfile.TemporaryDirectory(prefix="luce-png-") as name:
@@ -203,4 +216,5 @@ for flags in MODES:
         check_decoding(tmp, flags, dump, tool)
         check_encoding(tmp, flags, tool)
         check_damage(tmp, dump, tool)
+        check_color(tmp, flags)
 print("PASS luce-png")

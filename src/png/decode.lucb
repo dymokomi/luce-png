@@ -412,7 +412,6 @@ func sequential_decode(data: const u8[], p: const Parsed*, l: const Layout*, tar
         error(invalid, "PNG scanlines exceed byte limit")
     let raw = try new u8[expected] --- in memory.heap
     defer free(raw) in memory.heap
-    let stride = l.row_bytes(l.width) + 1
     let pipelined = threads > 1 and not p.info.interlaced and target.sink == none
     if pipelined:
         try pipelined_inflate(stream, raw, l, target, threads)

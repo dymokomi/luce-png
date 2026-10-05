@@ -1,5 +1,6 @@
 module.lucb
 chunks.lucb
+color.lucb
 filters.lucb
 decode.lucb
 source.lucb

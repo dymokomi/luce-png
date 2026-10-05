@@ -20,7 +20,20 @@ try raster.allocate()
 try png.decode(&raster)
 ```
 
-Every colour type and depth, palettes, tRNS and Adam7. PNGs this encoder wrote decode band by band on every processor (see below); any other PNG inflates on the calling thread while up to seven threads unfilter the rows behind it in a wavefront (each row a few kilobytes behind the one above) and another checks the Adler-32.
+Every colour type and depth, palettes, tRNS and Adam7, and the colour chunks:
+
+```luce
+let found = try png.info(data)
+if let cicp = found.colorimetry.cicp:              # cICP: ITU-T H.273 code points
+    use(cicp.color_primaries, cicp.transfer_function)
+let profile = try png.icc_profile(&found)          # iCCP inflated, or none; the caller frees it
+let intent = found.colorimetry.srgb_intent         # sRGB, gAMA (x 100 000), cHRM too
+```
+
+The colour chunks are read as libpng 1.6.50 reads them (each before PLTE and IDAT, once, at its
+length), and the iCCP profile is inflated up to its declared length and checked as
+png_handle_iCCP checks it; a chunk libpng would ignore is absent here too. Which one wins is
+the reader's choice: PNG 3 orders them cICP, iCCP, sRGB, gAMA, cHRM. PNGs this encoder wrote decode band by band on every processor (see below); any other PNG inflates on the calling thread while up to seven threads unfilter the rows behind it in a wavefront (each row a few kilobytes behind the one above) and another checks the Adler-32.
 
 `decode_rows_at` never holds the file: `read(context, offset, buffer)` gives its bytes. The chunks are walked in place, then the IDAT data is read a megabyte block at a time into the inflate window (banded files a group of bands at a time, decoded on every processor), each chunk's CRC checked as it goes. Interlaced files, whose rows complete only at the last pass, inflate into all their scanlines first, a block of the file at a time; `DecodeOptions.coarse` hears their first pass (every eighth pixel each way) as soon as it is in.
 
