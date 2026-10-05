@@ -1,4 +1,4 @@
-## The colour chunks luce-png reads from PNGs, printed as the libpng oracle prints them
+## The color chunks luce-png reads from PNGs, printed as the libpng oracle prints them
 ## (luce-browser-tools/oracles/luce-png/color): `color_tool FILE...`, one line a file,
 ## `NAME cicp=P,T,M,F|- icc=LENGTH:FNV1A|- srgb=I|- gama=G|- chrm=W...|-`.
 from luce_std import files

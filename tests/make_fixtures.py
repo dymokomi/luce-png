@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate tests/fixtures: small PNGs of every colour type, bit depth, filter and
+"""Regenerate tests/fixtures: small PNGs of every color type, bit depth, filter and
 interlacing, written by a plain Python encoder (so every filter and Adam7 occurs),
 plus Pillow's. The goldens in tests/fixtures/golden.txt were taken from the 0.1
 decoder (luce-png 6cc9dcf) and must not be regenerated with a changed decoder."""

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write tests/fixtures/color: small PNGs with colour chunks (cICP, iCCP, sRGB, gAMA, cHRM)
+"""Write tests/fixtures/color: small PNGs with color chunks (cICP, iCCP, sRGB, gAMA, cHRM)
 in the places and shapes libpng accepts and ignores, each with the profile its iCCP should
 inflate to beside it (NAME.icc) when libpng keeps one. The WPT and Ladybird images there
 (see NOTICE) are copied, not written here."""
@@ -75,7 +75,7 @@ def main():
     # A gray profile on an RGB image, and an RGB one on a gray image: libpng ignores both.
     files["rgb-gray-profile.png"] = png(4, 4, 2, rgb_rows, before=[(b"iCCP", iccp(b"gray", gray_profile))])
     files["gray-rgb-profile.png"] = png(4, 4, 0, gray_rows, before=[(b"iCCP", iccp(b"rgb", rgb_profile))])
-    # After PLTE the colour chunks are out of place; the second of two is a duplicate.
+    # After PLTE the color chunks are out of place; the second of two is a duplicate.
     palette = bytes([0x99, 0, 0, 0, 0x99, 0])
     files["iccp-after-plte.png"] = png(4, 4, 3, [bytes([0, 1, 0, 1])] * 4, palette=palette, after_plte=[(b"iCCP", iccp(b"late", rgb_profile)), (b"gAMA", struct.pack(">I", 45455))])
     files["two-iccp.png"] = png(4, 4, 2, rgb_rows, before=[(b"iCCP", iccp(b"first", rgb_profile)), (b"iCCP", iccp(b"second", rgb_profile[:-4] + b"\1\2\3\4"))])

@@ -1,9 +1,9 @@
 #==============================================================================================
 #
-#   png/color - The colour chunks: cICP, iCCP, sRGB, gAMA and cHRM
+#   png/color - The color chunks: cICP, iCCP, sRGB, gAMA and cHRM
 #
 #   DESCRIPTION:
-#       What a PNG says about its colours, read as libpng 1.6.50 reads it (the libpng
+#       What a PNG says about its colors, read as libpng 1.6.50 reads it (the libpng
 #       Ladybird decodes PNGs with): each chunk only before PLTE and IDAT, at most once, at
 #       its length, else ignored (libpng's benign errors); an sRGB intent above 3 and a gAMA
 #       above 2^31 - 1 are ignored too, and so is an iCCP chunk shorter than 92 bytes
@@ -11,7 +11,7 @@
 #       (`icc_profile`), as far as its declared length (libpng stops there, so it never
 #       checks the Adler-32), and checked as png_handle_iCCP checks it: its length (at
 #       least 132 bytes, at most libpng's 8 000 000 byte chunk limit), its header (length,
-#       tag count, rendering intent, 'acsp', a data colour space of RGB for a colour image
+#       tag count, rendering intent, 'acsp', a data color space of RGB for a color image
 #       and GRAY for a gray one, a profile class that may be embedded, an XYZ or Lab
 #       connection space) and its tag table (every tag inside the profile). A profile that
 #       fails is ignored, as libpng ignores it.
@@ -39,7 +39,7 @@ pub struct Chromaticities:
     pub var blue_x: u32
     pub var blue_y: u32
 
-## The colour chunks of a PNG.
+## The color chunks of a PNG.
 pub struct Colorimetry:
     pub var cicp: Cicp?
     ## iCCP: whether there is one, its profile name (Latin-1, 1 to 79 bytes), and the zlib
@@ -62,7 +62,7 @@ let icc_chunk_minimum: usize = 14
 func read_u32(data: const u8[], at: usize) -> u32:
     return ((u32)data[at] << 24) | ((u32)data[at + 1] << 16) | ((u32)data[at + 2] << 8) | (u32)data[at + 3]
 
-## A colour chunk named `name`, `body` its data: taken into `result` when libpng would
+## A color chunk named `name`, `body` its data: taken into `result` when libpng would
 ## accept it, else ignored.
 func take_color_chunk(result: Parsed*, walk: const Walk*, name: str, body: const u8[]):
     # Before PLTE and IDAT (libpng's hCOL), after IHDR.
@@ -160,13 +160,13 @@ pub func icc_profile(found: const Info*) -> u8[]?!:
         return none
     if read_u32(header, 36) != 0x61637370:
         return none
-    let colour = found.color == 2 or found.color == 3 or found.color == 6
+    let has_color = found.color == 2 or found.color == 3 or found.color == 6
     let space = read_u32(header, 16)
     if space == 0x52474220:
-        if not colour:
+        if not has_color:
             return none
     elif space == 0x47524159:
-        if colour:
+        if has_color:
             return none
     else:
         return none

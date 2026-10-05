@@ -3,8 +3,8 @@
 #   png - PNG decoding and encoding
 #
 #   DESCRIPTION:
-#       Static PNG: every standard colour type and bit depth, palettes, tRNS and Adam7, and
-#       the colour chunks (cICP, iCCP with its profile inflated, sRGB, gAMA, cHRM).
+#       Static PNG: every standard color type and bit depth, palettes, tRNS and Adam7, and
+#       the color chunks (cICP, iCCP with its profile inflated, sRGB, gAMA, cHRM).
 #       Decoding goes to 8-bit or 16-bit RGBA (`decode_rgba8`, `decode_rgba16`), to a
 #       row callback (`decode_rows`, or `decode_rows_at` reading the file in pieces), or
 #       to a Raster's f64 samples (`probe`, `decode`).
@@ -23,7 +23,7 @@
 #
 #       module.lucb    the public API
 #       chunks.lucb    chunk parsing, the header, palette and transparency
-#       color.lucb     the colour chunks and the ICC profile
+#       color.lucb     the color chunks and the ICC profile
 #       filters.lucb   filtering and unfiltering rows
 #       decode.lucb    parallel and sequential decoding, Adam7, output conversion
 #       source.lucb    decoding from a file read in pieces (`decode_rows_at`)
@@ -51,9 +51,9 @@ pub struct Info:
     ## 0 gray, 2 RGB, 3 palette, 4 gray and alpha, 6 RGBA.
     pub var color: usize
     pub var interlaced: bool
-    ## Whether it has alpha, from its colour type or a tRNS chunk.
+    ## Whether it has alpha, from its color type or a tRNS chunk.
     pub var alpha: bool
-    ## What it says about its colours: cICP, iCCP, sRGB, gAMA and cHRM (png/color).
+    ## What it says about its colors: cICP, iCCP, sRGB, gAMA and cHRM (png/color).
     pub var colorimetry: Colorimetry
 
 ## How a decode runs.

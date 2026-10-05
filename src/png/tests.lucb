@@ -312,7 +312,7 @@ test "the start of a file up to its first IDAT probes as the file whole":
     assert(head.width == 4 and head.height == 2 and head.channels.length == whole.channels.length and head.photo == 3)
     assert((str)head.palette == (str)whole.palette and (str)head.transparency == (str)whole.transparency)
 
-# mark: Colour chunks ==========================================================================
+# mark: Color chunks ==========================================================================
 from luce_std import files
 import c as libc
 import strings
@@ -323,9 +323,9 @@ func color_fixture(name: str) -> const u8[]:
     var buffer: u8[256]
     let path = strings.format(buffer, f"tests/fixtures/color/{name}") else trap("a fixture path is too long")
     with memory.heap:
-        return (files.read((libc.str)path) else trap("cannot read a colour fixture")).value
+        return (files.read((libc.str)path) else trap("cannot read a color fixture")).value
 
-test "colour chunks are read as libpng reads them":
+test "color chunks are read as libpng reads them":
     let both = try info(color_fixture("cicp-iccp.png"))
     let cicp = both.colorimetry.cicp else trap("cICP is read")
     assert(cicp.color_primaries == 12 and cicp.transfer_function == 13 and cicp.matrix_coefficients == 0 and cicp.video_full_range == 1)

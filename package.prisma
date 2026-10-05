@@ -4,7 +4,7 @@ def package "luce-png" {
     str version = "0.7.0"
     str kind = "package"
     str language = "luce-base"
-    str description = "A fast multithreaded PNG decoder and encoder for Luce/Base: every colour type and depth, 8- and 16-bit RGBA, row bands, streamed encoding with parallel deflate."
+    str description = "A fast multithreaded PNG decoder and encoder for Luce/Base: every color type and depth, 8- and 16-bit RGBA, row bands, streamed encoding with parallel deflate."
     str readme = "README.md"
     str[] public = ["png"]
 

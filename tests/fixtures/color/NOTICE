@@ -1,4 +1,4 @@
-PNGs with colour chunks for png/color's tests (src/png/tests.lucb, tests/run.py).
+PNGs with color chunks for png/color's tests (src/png/tests.lucb, tests/run.py).
 
 Written by tests/make_color_fixtures.py (no third-party data): every file here not named
 below, with NAME.icc the profile libpng inflates from NAME.png's iCCP chunk.

@@ -9,7 +9,7 @@ Split out of luce-image on 2026-09-22 so every file format is its own package, l
 ```luce
 from luce_png import png
 
-let found = try png.info(data)                        # size, bits, colour type, interlace, alpha
+let found = try png.info(data)                        # size, bits, color type, interlace, alpha
 try png.decode_rgba8(data, pixels)                    # w * h * 4 bytes; 16-bit rounds to 8
 try png.decode_rgba16(data, samples)                  # w * h * 4 u16; 8-bit scales by 257
 try png.decode_rows(data, sink, (void*)&state, deep = false)   # bands of RGBA rows, in order
@@ -20,7 +20,7 @@ try raster.allocate()
 try png.decode(&raster)
 ```
 
-Every colour type and depth, palettes, tRNS and Adam7, and the colour chunks:
+Every color type and depth, palettes, tRNS and Adam7, and the color chunks:
 
 ```luce
 let found = try png.info(data)
@@ -30,7 +30,7 @@ let profile = try png.icc_profile(&found)          # iCCP inflated, or none; the
 let intent = found.colorimetry.srgb_intent         # sRGB, gAMA (x 100 000), cHRM too
 ```
 
-The colour chunks are read as libpng 1.6.50 reads them (each before PLTE and IDAT, once, at its
+The color chunks are read as libpng 1.6.50 reads them (each before PLTE and IDAT, once, at its
 length), and the iCCP profile is inflated up to its declared length and checked as
 png_handle_iCCP checks it; a chunk libpng would ignore is absent here too. Which one wins is
 the reader's choice: PNG 3 orders them cICP, iCCP, sRGB, gAMA, cHRM. PNGs this encoder wrote decode band by band on every processor (see below); any other PNG inflates on the calling thread while up to seven threads unfilter the rows behind it in a wavefront (each row a few kilobytes behind the one above) and another checks the Adler-32.
@@ -59,7 +59,7 @@ try png.encode(&raster, &out)                          # a Raster, uint8 or uint
 
 24 MP RGBA8 on an M4 Max (16 cores), `tests/bench.lucb`; libpng through Pillow for reference:
 
-| | photo | flat-colour art |
+| | photo | flat-color art |
 | --- | ---: | ---: |
 | 0.1 decode (Raster) | 5942 ms | 1408 ms |
 | decode, file from this encoder | 58 ms | 23 ms |
@@ -79,4 +79,4 @@ Decoding a libpng photo is bound by inflating one stream on one thread.
 ./test.sh    # module tests, then the drivers in native and C modes against tests/fixtures
 ```
 
-`tests/fixtures/golden.txt` holds the 0.1 decoder's samples for every fixture (made by `tests/make_fixtures.py`: every colour type, depth, filter and interlacing, and Pillow's files). The gate checks every decoding API against them and, with Pillow, against libpng; that the encoder is lossless in all eight formats and gives the same bytes across threads and streaming; and that damaged files fail cleanly.
+`tests/fixtures/golden.txt` holds the 0.1 decoder's samples for every fixture (made by `tests/make_fixtures.py`: every color type, depth, filter and interlacing, and Pillow's files). The gate checks every decoding API against them and, with Pillow, against libpng; that the encoder is lossless in all eight formats and gives the same bytes across threads and streaming; and that damaged files fail cleanly.

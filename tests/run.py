@@ -10,7 +10,7 @@
   all and streamed, at every level and filter, in one band or many; its files
   decode the same here in parallel and sequentially and (with Pillow) in libpng;
 - truncated and corrupted files fail cleanly, never crash or hang;
-- the colour chunks of tests/fixtures/color (cICP, iCCP and its profile, sRGB, gAMA, cHRM)
+- the color chunks of tests/fixtures/color (cICP, iCCP and its profile, sRGB, gAMA, cHRM)
   read as libpng 1.6.50 reads them (expected.txt, from the libpng oracle).
 """
 import hashlib, os, random, struct, subprocess, tempfile
@@ -202,8 +202,8 @@ def check_color(tmp, flags):
     names = sorted(p.name for p in folder.glob("*.png"))
     found = subprocess.run([str(tool), *names], cwd=folder, env=env, capture_output=True, timeout=300, check=True).stdout.decode()
     if found != (folder / "expected.txt").read_text():
-        fail("the colour chunks differ from libpng's (tests/fixtures/color/expected.txt)")
-    print(f"ok    {len(names)} PNGs' colour chunks as libpng reads them")
+        fail("the color chunks differ from libpng's (tests/fixtures/color/expected.txt)")
+    print(f"ok    {len(names)} PNGs' color chunks as libpng reads them")
 
 
 for flags in MODES:
