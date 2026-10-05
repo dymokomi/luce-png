@@ -1,0 +1,128 @@
+#==============================================================================================
+#
+#   png/tests_apng - The animation's tests
+#
+#   DESCRIPTION:
+#       Ladybird's APNG cases (Tests/LibGfx/TestImageDecoder.cpp test_apng and
+#       test_apng_idat_not_affecting_next_frame, on its test inputs, BSD-2-Clause), and the
+#       frames, timing, disposal and failures of files made by
+#       luce-browser-tools/oracles/luce-png/apng/gen_apng.py (tests/fixtures/apng).
+#
+#==============================================================================================
+
+## The APNG fixture `name`, kept in the heap for the run.
+func apng_fixture(name: str) -> const u8[]:
+    var buffer: u8[256]
+    let path = strings.format(buffer, f"tests/fixtures/apng/{name}") else trap("a fixture path is too long")
+    with memory.heap:
+        return (files.read((libc.str)path) else trap("cannot read an APNG fixture")).value
+
+## Every frame of `animation`, rendered in order, one canvas after another.
+func render_all(animation: Animation*) -> u8[]!:
+    let size = animation.info.width * animation.info.height * 4
+    let all = try new u8[size * animation.frames().length] in memory.heap
+    for index in 0..<animation.frames().length:
+        try animation.render(index, all[index * size..])
+    return all
+
+## The pixel at (`x`, `y`) of the RGBA `canvas`, `width` wide, as 0xRRGGBBAA.
+func canvas_pixel(canvas: const u8[], width: usize, x: usize, y: usize) -> u32:
+    let at = (y * width + x) * 4
+    return ((u32)canvas[at] << 24) | ((u32)canvas[at + 1] << 16) | ((u32)canvas[at + 2] << 8) | (u32)canvas[at + 3]
+
+test "test_apng":
+    var animation = try Animation.open(apng_fixture("apng-1-frame.png"))
+    defer animation.release()
+    assert(animation.frames().length == 1 and animation.info.loop_count == 0 and animation.complete)
+    assert(animation.info.width == 128 and animation.info.height == 64)
+    # 100/100 s, after a hidden default image.
+    assert(animation.frames()[0].duration == 1000)
+    let canvas = try render_all(&animation)
+    defer free(canvas) in memory.heap
+    assert(canvas_pixel(canvas, 128, 64, 32) == 0x75fc4cff)
+
+test "test_apng_idat_not_affecting_next_frame":
+    # The hidden default image is not drawn under the frame.
+    var animation = try Animation.open(apng_fixture("apng-blend.png"))
+    defer animation.release()
+    assert(animation.frames().length == 1 and animation.info.loop_count == 0)
+    assert(animation.info.width == 100 and animation.info.height == 100)
+    assert(animation.frames()[0].duration == 1000)
+    let canvas = try render_all(&animation)
+    defer free(canvas) in memory.heap
+    assert(canvas_pixel(canvas, 100, 0, 0) == 0)
+
+test "an animation's frames carry their fcTL, and render in any order":
+    let data = apng_fixture("hand-offsets-over.png")
+    let found = try info(data)
+    assert(found.animated and found.frame_count == 3 and found.loop_count == 2 and found.plays() == 2)
+    var animation = try Animation.open(data)
+    defer animation.release()
+    let frames = animation.frames()
+    assert(frames.length == 3)
+    # Delays 0/0, 5/0 (a denominator of 0 is 100) and 0/7.
+    assert(frames[0].duration == 0 and frames[1].duration == 50 and frames[2].duration == 0)
+    assert(frames[1].delay_numerator == 5 and frames[1].delay_denominator == 0)
+    assert(frames[0].disposal == Disposal.previous and frames[1].disposal == Disposal.background and frames[2].disposal == Disposal.keep)
+    assert(frames[1].left == 4 and frames[1].top == 3 and frames[1].width == 8 and frames[1].height == 6 and frames[1].blend)
+    let in_order = try render_all(&animation)
+    defer free(in_order) in memory.heap
+    let size = found.width * found.height * 4
+    let again = try new u8[size] in memory.heap
+    defer free(again) in memory.heap
+    let order: usize[4] = [2, 0, 1, 2]
+    for index in order:
+        try animation.render(index, again)
+        for i in 0..<size:
+            assert(again[i] == in_order[index * size + i])
+
+test "a still PNG is an animation of one frame, its image":
+    let data = apng_fixture("still.png")
+    let found = try info(data)
+    assert(not found.animated and found.frame_count == 1 and found.plays() == 1)
+    var animation = try Animation.open(data)
+    defer animation.release()
+    let canvas = try render_all(&animation)
+    defer free(canvas) in memory.heap
+    let still = try new u8[canvas.length] in memory.heap
+    defer free(still) in memory.heap
+    try decode_rgba8(data, still)
+    for i in 0..<canvas.length:
+        assert(canvas[i] == still[i])
+
+test "the still decoders give an APNG's default image":
+    let data = apng_fixture("hand-hidden-default.png")
+    let found = try info(data)
+    assert(found.animated and found.frame_count == 2)
+    var animation = try Animation.open(data)
+    defer animation.release()
+    assert(animation.frames().length == 2)
+    let default_image = try new u8[9 * 7 * 4] in memory.heap
+    defer free(default_image) in memory.heap
+    try decode_rgba8(data, default_image)
+    let first = try new u8[9 * 7 * 4] in memory.heap
+    defer free(first) in memory.heap
+    try animation.render(0, first)
+    # The first frame (5x5 over a transparent canvas) is not the default image.
+    assert(canvas_pixel(first, 9, 0, 0) == 0 and canvas_pixel(default_image, 9, 0, 0) != canvas_pixel(first, 9, 0, 0))
+
+## Whether the fixture `name` fails to open, as corrupt.
+func fails_to_open(name: str) -> bool:
+    var animation = Animation.open(apng_fixture(name)) catch failure:
+        return failure.code == corrupt
+    animation.release()
+    return false
+
+test "damage before the image data fails; after it, the frames before it stand":
+    assert(fails_to_open("hand-sequence-before.png") and fails_to_open("hand-fctl-blend-before.png"))
+    var missing = try Animation.open(apng_fixture("hand-missing-frames.png"))
+    defer missing.release()
+    assert(not missing.complete and missing.frames().length == 2 and missing.info.frame_count == 4)
+    var bad = try Animation.open(apng_fixture("hand-crc-idat.png"))
+    defer bad.release()
+    let canvas = try new u8[8 * 8 * 4] in memory.heap
+    defer free(canvas) in memory.heap
+    var failed = false
+    bad.render(0, canvas) catch:
+        failed = true
+    assert(failed)

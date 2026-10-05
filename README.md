@@ -37,6 +37,44 @@ the reader's choice: PNG 3 orders them cICP, iCCP, sRGB, gAMA, cHRM. PNGs this e
 
 `decode_rows_at` never holds the file: `read(context, offset, buffer)` gives its bytes. The chunks are walked in place, then the IDAT data is read a megabyte block at a time into the inflate window (banded files a group of bands at a time, decoded on every processor), each chunk's CRC checked as it goes. Interlaced files, whose rows complete only at the last pass, inflate into all their scanlines first, a block of the file at a time; `DecodeOptions.coarse` hears their first pass (every eighth pixel each way) as soon as it is in.
 
+## Animated PNG
+
+```luce
+let found = try png.info(data)                 # found.animated, frame_count, loop_count, plays()
+var animation = try png.Animation.open(data)   # `data` must outlive it
+defer animation.release()
+for (index, frame) in animation.frames().indexed():
+    try animation.render(index, pixels)        # frame `index`, every frame before it composited
+    show(pixels, frame.duration)               # milliseconds: delay_numerator * 1000 / delay_denominator
+```
+
+An APNG's acTL, fcTL and fdAT chunks are walked as libpng 1.6.50 with the APNG patch (the
+libpng Ladybird links) reads them when Ladybird's PNG loader drives it: frame by frame, the
+hidden default image counted, fcTL and fdAT in one sequence of numbers, an fcTL out of range
+or with bad operations an error, the first frame's fcTL ignored off the origin or at another
+size, OVER on an opaque image read as SOURCE, chunks between frames skipped. A failure
+before the image data fails `Animation.open`; after it, the frames read so far stand and
+`complete` is false (Ladybird then shows the first frame as a still image). The still
+decoders give the default image.
+
+Each `Frame` has its rectangle (`left`, `top`, `width`, `height`), `delay_numerator` and
+`delay_denominator` as written, `duration` in milliseconds (a denominator of 0 is 100),
+`disposal` (`keep`, `background`, `previous`) and `blend` (OVER, else SOURCE). `render`
+disposes of the frame before, decodes the frame at its size and draws it into its
+rectangle; OVER composites straight alpha in the integers of apngdis's BlendOver (by the
+APNG patch's author). A still PNG is an animation of one frame.
+
+`tests/fixtures/apng` (Ladybird's two APNG test inputs and 34 files from
+`gen_apng.py`: Pillow's animations in every disposal, blend and color type, and hand-built
+ones with offsets, odd delays, interlacing, chunks between frames, too many and too few
+frames, broken sequences, CRCs and fcTLs, files cut short) decode to libpng's frames,
+timing and failures, every composited frame's hash the same as the oracle's
+(`luce-browser-tools/oracles/luce-png/apng`). Of 1,500 mutations of them with valid CRCs,
+1,477 agree; libpng also takes a frame whose zlib stream goes on past its rows, or a second
+tRNS chunk, with a warning, where luce-png refuses them. Like the still decoders,
+16-bit samples round to 8 bits where libpng's `png_set_strip_16` (Ladybird's) keeps the
+high byte, so a 16-bit APNG can differ from Ladybird's by one.
+
 ## Encoding
 
 ```luce

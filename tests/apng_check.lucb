@@ -1,0 +1,65 @@
+## The APNG driver of the gate, the Luce half of the oracle comparison
+## (luce-browser-tools/oracles/luce-png/apng/apng_oracle.c, whose output it matches line for
+## line). `apng_check FILE...` prints for each file, as Ladybird's PNG loader reads it,
+## `PATH ok WIDTH HEIGHT FRAMES PLAYS` (FRAMES and PLAYS `-` for a still PNG), then
+## `frame K X Y W H NUM DEN DISPOSE BLEND HASH` for each frame rendered (HASH the 64-bit
+## FNV-1a of the canvas as RGBA), then `PATH fallback K` when frame K does not decode or the
+## animation ends early; `PATH init-error` when the header cannot be read.
+from luce_std import files
+import c
+import io
+import memory
+import png
+
+extern func fflush(file: void*?) -> i32
+
+## The 64-bit FNV-1a hash of `data`.
+func fnv(data: const u8[]) -> u64:
+    var hash: u64 = 14695981039346656037
+    for byte in data:
+        hash ^= (u64)byte
+        hash = hash *% 1099511628211
+    return hash
+
+## The fcTL code of a disposal.
+func disposal_code(disposal: png.Disposal) -> u32:
+    return match disposal:
+        .keep => 0
+        .background => 1
+        .previous => 2
+
+func run(path: str, verbose: bool) -> !:
+    let file = try files.read((c.str)path)
+    defer file.release()
+    let data = file.value
+    var animation = png.Animation.open(data) catch:
+        print(f"{path} init-error")
+        return
+    defer animation.release()
+    let found = animation.info
+    let out = io.stdout()
+    if found.animated:
+        _ = try out.write(f"{path} ok {found.width} {found.height} {found.frame_count} {found.loop_count}\n")
+    else:
+        _ = try out.write(f"{path} ok {found.width} {found.height} - -\n")
+    let pixels = try new u8[found.width * found.height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    for (index, frame) in animation.frames().indexed():
+        animation.render(index, pixels) catch failure:
+            print(f"{path} fallback {index}")
+            if verbose:
+                print(f"  {failure.message}")
+            return
+        if found.animated:
+            print(f"frame {index} {frame.left} {frame.top} {frame.width} {frame.height} {frame.delay_numerator} {frame.delay_denominator} {disposal_code(frame.disposal)} {1 if frame.blend else 0} {fnv(pixels):016x}")
+        else:
+            print(f"frame 0 0 0 {found.width} {found.height} 0 0 0 0 {fnv(pixels):016x}")
+    if not animation.complete:
+        print(f"{path} fallback {animation.frames().length}")
+
+pub func main(arguments: str[]) -> i32!:
+    let verbose = arguments.length > 1 and arguments[1] == "-v"
+    for index in (2 if verbose else 1)..<arguments.length:
+        try run(arguments[index], verbose)
+        _ = fflush(none)
+    return 0

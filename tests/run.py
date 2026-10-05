@@ -11,7 +11,12 @@
   decode the same here in parallel and sequentially and (with Pillow) in libpng;
 - truncated and corrupted files fail cleanly, never crash or hang;
 - the color chunks of tests/fixtures/color (cICP, iCCP and its profile, sRGB, gAMA, cHRM)
-  read as libpng 1.6.50 reads them (expected.txt, from the libpng oracle).
+  read as libpng 1.6.50 reads them (expected.txt, from the libpng oracle);
+- the animated PNGs of tests/fixtures/apng (Ladybird's and gen_apng.py's, damaged ones
+  among them) give the frames, timing and failures libpng 1.6.50 with the APNG patch
+  gives when driven as Ladybird's PNG loader drives it, every composited frame's hash the
+  same (expected.txt, from luce-browser-tools/oracles/luce-png/apng), in native, C and
+  diagnostic builds.
 """
 import hashlib, os, random, struct, subprocess, tempfile
 from pathlib import Path
@@ -206,7 +211,24 @@ def check_color(tmp, flags):
     print(f"ok    {len(names)} PNGs' color chunks as libpng reads them")
 
 
-for flags in MODES:
+def check_apng(tmp, flags):
+    tool = tmp / "apng_check"
+    run([BASE, "build", ROOT / "tests/apng_check.lucb", *flags, "-o", tool], check=True)
+    folder = ROOT / "tests/fixtures/apng"
+    names = sorted(p.name for p in folder.glob("*.png"))
+    found = subprocess.run([str(tool), *names], cwd=folder, env=env, capture_output=True, timeout=300, check=True).stdout.decode()
+    expected = "".join(line + "\n" for line in (folder / "expected.txt").read_text().splitlines() if not line.startswith("#"))
+    if found != expected:
+        fail(f"the animated PNGs differ from libpng's (tests/fixtures/apng/expected.txt), {' '.join(flags)}")
+    frames = sum(1 for line in found.splitlines() if line.startswith("frame"))
+    print(f"ok    {len(names)} PNGs' {frames} frames as libpng with the APNG patch reads them ({' '.join(flags)})")
+
+
+for flags in MODES + [["--profile", "diagnostic"]]:
+    if flags[0] == "--profile":
+        with tempfile.TemporaryDirectory(prefix="luce-png-") as name:
+            check_apng(Path(name), flags)
+        continue
     run([BASE, "test", ROOT / "src/png", *flags], check=True)
     with tempfile.TemporaryDirectory(prefix="luce-png-") as name:
         tmp = Path(name)
@@ -217,4 +239,5 @@ for flags in MODES:
         check_encoding(tmp, flags, tool)
         check_damage(tmp, dump, tool)
         check_color(tmp, flags)
+        check_apng(tmp, flags)
 print("PASS luce-png")

@@ -29,6 +29,8 @@
 #       source.lucb    decoding from a file read in pieces (`decode_rows_at`)
 #       encode.lucb    the Encoder: bands, chunks and the zlib stream around them
 #       work.lucb      the worker threads
+#       apng.lucb      the animation chunks: acTL, fcTL, fdAT, walked as libpng reads them
+#       animation.lucb Animation: an APNG's frames decoded and composited
 #       tests.lucb     the module's tests
 #
 #==============================================================================================
@@ -55,6 +57,18 @@ pub struct Info:
     pub var alpha: bool
     ## What it says about its colors: cICP, iCCP, sRGB, gAMA and cHRM (png/color).
     pub var colorimetry: Colorimetry
+    ## Whether it is an animated PNG: an acTL chunk before the image data, read as libpng
+    ## reads it (png/apng).
+    pub var animated: bool
+    ## The frames an animation shows (acTL's count, the default image counted only when it
+    ## is the first frame); 1 for a still PNG.
+    pub var frame_count: usize
+    ## How many times the animation plays (acTL's num_plays): 0 forever.
+    pub var loop_count: u32
+
+    ## How many times browsers play the animation in all: 0 forever, 1 for a still PNG.
+    pub func plays() -> u32:
+        return self.loop_count if self.animated else 1
 
 ## How a decode runs.
 pub struct DecodeOptions:

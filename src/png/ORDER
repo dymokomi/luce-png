@@ -6,4 +6,7 @@ decode.lucb
 source.lucb
 encode.lucb
 work.lucb
+apng.lucb
+animation.lucb
 tests.lucb
+tests_apng.lucb

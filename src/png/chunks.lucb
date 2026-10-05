@@ -108,6 +108,8 @@ func parse_head(data: const u8[]) -> Parsed!:
     if not walk.header:
         error(corrupt, "PNG must start with IHDR")
     result.info.alpha = result.info.color == 4 or result.info.color == 6 or result.transparency.length > 0
+    if not result.info.animated:
+        result.info.frame_count = 1
     return result
 
 ## Where a walk through the chunks stands.
@@ -122,6 +124,8 @@ struct Walk:
         if not self.end:
             error(corrupt, "PNG has no IEND")
         result.info.alpha = result.info.color == 4 or result.info.color == 6 or result.transparency.length > 0
+        if not result.info.animated:
+            result.info.frame_count = 1
         return *result
 
 ## One chunk, its type at `start` in the file and `size` bytes of data in
@@ -185,7 +189,7 @@ func take_chunk(result: Parsed*, walk: Walk*, name: str, body: const u8[], start
     elif name == "cICP" or name == "iCCP" or name == "sRGB" or name == "gAMA" or name == "cHRM":
         take_color_chunk(result, walk, name, body)
     elif name == "acTL":
-        error(unsupported, "APNG animation is not supported")
+        try take_actl(result, walk, body)
     elif (name.bytes[0] & 32) == 0:
         error(unsupported, "unknown critical PNG chunk")
     if walk.pixels and name != "IDAT":

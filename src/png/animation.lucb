@@ -1,0 +1,226 @@
+#==============================================================================================
+#
+#   png/animation - An APNG's frames decoded and composited
+#
+#   DESCRIPTION:
+#       An `Animation` holds a PNG's frames (png/apng) and a canvas the size of the image,
+#       transparent to begin with, as at the beginning of each play. Rendering frame N
+#       disposes of frame N - 1 as its fcTL says (keeps its rectangle, clears it to
+#       transparent, or restores what was there before the frame was drawn), then decodes
+#       frame N (its IDAT or fdAT data, with the image's color type, depth, palette, tRNS
+#       and interlacing, at its own size) and draws it into its rectangle: SOURCE replaces
+#       the rectangle, OVER composites the frame over it. The caller receives a copy of the
+#       whole canvas, as Ladybird's PNG loader pushes each frame. A hidden default image is
+#       decoded and discarded before the first frame, as libpng reads it.
+#
+#       OVER is straight-alpha compositing in the integers of apngdis's BlendOver (by the
+#       APNG patch's author): an opaque pixel replaces, a transparent one leaves the canvas,
+#       and otherwise each channel is the alpha-weighted average, rounded down. Ladybird draws
+#       through Skia's float pipeline, which can differ by one in a channel.
+#
+#       A still PNG is an animation of one frame.
+#
+#==============================================================================================
+
+## What becomes of a frame's rectangle before the next frame is drawn.
+pub enum Disposal:
+    ## It stays (APNG_DISPOSE_OP_NONE).
+    keep
+    ## It is cleared to transparent (APNG_DISPOSE_OP_BACKGROUND).
+    background
+    ## It is restored to what was there before the frame was drawn
+    ## (APNG_DISPOSE_OP_PREVIOUS).
+    previous
+
+## One frame: where it is drawn, for how long, and how.
+pub struct Frame:
+    ## The fcTL's rectangle, within the image.
+    pub var left: usize
+    pub var top: usize
+    pub var width: usize
+    pub var height: usize
+    ## The delay as written: numerator / denominator seconds, a denominator of 0 meaning
+    ## 100.
+    pub var delay_numerator: u16
+    pub var delay_denominator: u16
+    ## The delay in milliseconds, rounded down.
+    pub var duration: u32
+    pub var disposal: Disposal = Disposal.keep
+    ## Whether the frame is composited over the canvas (APNG_BLEND_OP_OVER), or replaces
+    ## its rectangle (SOURCE).
+    pub var blend: bool
+    ## Its image data: pieces of the walk.
+    var first_piece: usize
+    var piece_count: usize
+
+## A PNG's frames, rendered as whole composited canvases. `data` must stay valid while the
+## animation is in use; `release` frees what it holds.
+pub struct Animation:
+    ## The image's size and format, and the acTL's frame and loop counts.
+    pub var info: Info
+    ## Whether every frame acTL declares was found; false when the file is damaged or ends
+    ## after the frames found (Ladybird then shows the first frame as a still image).
+    pub var complete: bool
+    var data: const u8[]
+    var parsed: Parsed
+    var walked: Walked
+    var options: DecodeOptions
+    ## The canvas, `info.width * info.height` RGBA pixels, as the last frame rendered left
+    ## it; what was under that frame, for its "previous" disposal; a frame's own pixels.
+    var canvas: u8[]
+    var saved: u8[]
+    var frame_pixels: u8[]
+    ## The frame the next `render` draws first.
+    var next: usize
+
+    ## An animation of the PNG in `data`: its chunks walked to its frames (no pixels decoded)
+    ## and its canvases allocated. Fails where libpng fails to read the PNG's header.
+    pub static func open(data: const u8[], options: DecodeOptions = DecodeOptions()) -> Animation!:
+        var parsed = Parsed()
+        errdefer parsed.close()
+        var walked = try walk_frames(data, &parsed)
+        errdefer walked.release()
+        let size = parsed.info.width * parsed.info.height * 4
+        if size > options.max_bytes:
+            error(limit, "PNG canvas exceeds byte limit")
+        let canvas = try new u8[size] in memory.heap
+        errdefer free(canvas) in memory.heap
+        let frame_pixels = try new u8[size] --- in memory.heap
+        return Animation(info = parsed.info, complete = walked.complete, data = data, parsed = parsed, walked = walked, options = options, canvas = canvas, frame_pixels = frame_pixels)
+
+    ## The frames found, in order.
+    pub func frames() -> const Frame[]:
+        return self.walked.frames[..<self.walked.count]
+
+    ## Render frame `index` into `out`, `info.width * info.height * 4` bytes of straight
+    ## RGBA: the canvas with every frame up to it composited. Frames render fastest in
+    ## order; an earlier index starts again from the first. Fails for an index past the
+    ## last frame, an `out` too small, or a frame (or the hidden default image before the
+    ## first) that does not decode.
+    pub func render(index: usize, out: u8[]) -> !:
+        if index >= self.walked.count:
+            error(invalid, "PNG frame index is past the last frame")
+        let size = self.canvas.length
+        if out.length < size:
+            error(invalid, "PNG output buffer is smaller than the picture")
+        if index + 1 < self.next or self.next == 0:
+            memory.set(self.canvas, 0)
+            self.next = 0
+            if self.walked.hidden:
+                # libpng reads the default image before the first frame.
+                try self.decode_frame(self.walked.hidden_first, self.walked.hidden_count, self.info.width, self.info.height, true)
+        while self.next <= index:
+            if self.next > 0:
+                self.dispose(self.walked.frames[self.next - 1])
+            let frame = self.walked.frames[self.next]
+            if frame.disposal == Disposal.previous:
+                try self.save(frame)
+            try self.decode_frame(frame.first_piece, frame.piece_count, frame.width, frame.height, frame.first_piece == 0)
+            self.draw(frame)
+            self.next += 1
+        memory.copy(out, self.canvas, size)
+
+    ## Free the frames, the canvases and the header.
+    pub func release():
+        self.walked.release()
+        self.parsed.close()
+        free(self.canvas) in memory.heap
+        free(self.frame_pixels) in memory.heap
+        if self.saved.length > 0:
+            free(self.saved) in memory.heap
+        var no_bytes: u8[]
+        self.saved = no_bytes
+        var no_walk = Walked()
+        self.walked = no_walk
+
+    # mark: Frames ============================================================================
+
+    ## Decode the image data of pieces `first` to `first + count` (IDAT chunks, whose CRCs
+    ## are checked, when `idat`) as a `width` by `height` image into `frame_pixels`. As
+    ## libpng (through zlib) reads a frame, the stream must give every row, and its Adler-32
+    ## is checked when it is there; a stream cut short after the rows is accepted. (libpng
+    ## also takes a stream that goes on past the rows, with a warning; this refuses it.)
+    func decode_frame(first: usize, count: usize, width: usize, height: usize, idat: bool) -> !:
+        var frame = self.parsed
+        frame.info.width = width
+        frame.info.height = height
+        frame.pieces = self.walked.pieces[first..<first + count]
+        frame.count = count
+        frame.bands = 0
+        if count == 0:
+            error(corrupt, "PNG frame has no image data")
+        if idat:
+            try frame.check_idat(self.data, 1)
+        let l = Layout.of(&frame)
+        var total: usize = 0
+        for index in 0..<count:
+            total += frame.pieces[index].length
+        if total > self.options.max_bytes:
+            error(limit, "PNG data exceeds byte limit")
+        let stream = frame.piece(self.data, 0) if count == 1 else try join_pieces(self.data, &frame, total)
+        defer:
+            if count > 1:
+                free((u8[])stream) in memory.heap
+        if stream.length < 2:
+            error(corrupt, "invalid zlib header")
+        try check_zlib_header(stream)
+        let raw = try new u8[scanline_bytes(&l, frame.info.interlaced)] --- in memory.heap
+        defer free(raw) in memory.heap
+        let used = try flate.inflate_raw(stream[2..], raw)
+        if stream.length >= 2 + used + 4:
+            try check_adler(stream, 2 + used, flate.adler32(raw))
+        var target = Target(bytes = self.frame_pixels[..<width * height * 4])
+        try rows_in_order(&frame, &l, raw, &target)
+
+    ## Draw the decoded frame into its rectangle, replacing it or composited over it.
+    func draw(frame: Frame):
+        let width = self.info.width
+        for y in 0..<frame.height:
+            let row = self.canvas.data + ((frame.top + y) * width + frame.left) * 4
+            let source = self.frame_pixels.data + y * frame.width * 4
+            if not frame.blend:
+                memory.copy(u8[](row, frame.width * 4), u8[](source, frame.width * 4), frame.width * 4)
+                continue
+            for x in 0..<frame.width:
+                blend_over(row + x * 4, source + x * 4)
+
+    ## Dispose of `frame`, the last one drawn, before the next is drawn over it.
+    func dispose(frame: Frame):
+        let width = self.info.width
+        match frame.disposal:
+            .keep:
+                return
+            .background:
+                for y in 0..<frame.height:
+                    let row = ((frame.top + y) * width + frame.left) * 4
+                    memory.set(self.canvas[row..<row + frame.width * 4], 0)
+            .previous:
+                let span = frame.width * 4
+                for y in 0..<frame.height:
+                    let row = ((frame.top + y) * width + frame.left) * 4
+                    memory.copy(self.canvas[row..], self.saved[y * span..], span)
+
+    ## Keep what is under `frame` before it is drawn, for its "previous" disposal.
+    func save(frame: Frame) -> !:
+        if self.saved.length == 0:
+            self.saved = try new u8[self.canvas.length] --- in memory.heap
+        let span = frame.width * 4
+        for y in 0..<frame.height:
+            let row = ((frame.top + y) * self.info.width + frame.left) * 4
+            memory.copy(self.saved[y * span..], self.canvas[row..], span)
+
+## apngdis's BlendOver: the straight RGBA pixel `source` over `target`.
+func blend_over(target: u8*, source: const u8*):
+    let alpha = (u32)source[3]
+    if alpha == 255 or (alpha != 0 and target[3] == 0):
+        for c in 0..<(usize)4:
+            target[c] = source[c]
+        return
+    if alpha == 0:
+        return
+    let u = alpha * 255
+    let v = (255 - alpha) * (u32)target[3]
+    let al = u + v
+    for c in 0..<(usize)3:
+        target[c] = (u8)(((u32)source[c] * u + (u32)target[c] * v) // al)
+    target[3] = (u8)(al // 255)

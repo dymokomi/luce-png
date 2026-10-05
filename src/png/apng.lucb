@@ -1,0 +1,275 @@
+#==============================================================================================
+#
+#   png/apng - The animation chunks: acTL, fcTL, fdAT, walked as libpng reads them
+#
+#   DESCRIPTION:
+#       An animated PNG (APNG) adds an acTL chunk before the image data (how many frames,
+#       how many plays), an fcTL chunk before each frame (its rectangle, delay, disposal and
+#       blending) and fdAT chunks with the frames after the first (a sequence number, then
+#       image data like IDAT's). The default image (IDAT) is the first frame when an fcTL
+#       comes before it, else it is hidden: shown only by decoders without APNG support.
+#
+#       This walks the chunks as libpng 1.6.50 with the APNG patch reads them, frame by
+#       frame, when Ladybird's PNG loader drives it (png_read_info, then
+#       png_read_frame_head and png_read_image for each of acTL's frames, the hidden image
+#       counted): fcTL and fdAT carry one sequence of numbers from 0, out of order an error;
+#       an fcTL that is out of range or has bad operations is an error; the first frame's
+#       fcTL must be at the origin and the size of the image, else it is ignored; OVER
+#       blending on an opaque image is SOURCE; chunks between frames are skipped. libpng
+#       uses fcTL and fdAT chunks whose CRC is wrong, as their checks are ancillary.
+#       Before the image data a failure is a failure to read the PNG (Animation.open
+#       fails); after it, the frames read so far stand and the animation is incomplete, as
+#       Ladybird keeps them.
+#
+#==============================================================================================
+
+## APNG_DISPOSE_OP_*, APNG_BLEND_OP_*.
+let dispose_op_none: u8 = 0
+let dispose_op_background: u8 = 1
+let dispose_op_previous: u8 = 2
+let blend_op_source: u8 = 0
+let blend_op_over: u8 = 1
+## png_get_uint_31's limit.
+let uint_31_max: u32 = 0x7fffffff
+
+## png_get_uint_31: a 31-bit number, larger ones an error.
+func uint_31(data: const u8[], at: usize) -> u32!:
+    let value = read_u32(data, at)
+    if value > uint_31_max:
+        error(corrupt, "PNG unsigned integer out of range")
+    return value
+
+## png_handle_acTL: before the image data, once, of 8 bytes, at least one frame; else
+## ignored.
+func take_actl(result: Parsed*, walk: const Walk*, body: const u8[]) -> !:
+    if walk.pixels or result.info.animated or body.length != 8:
+        return
+    let num_frames = try uint_31(body, 0)
+    let num_plays = try uint_31(body, 4)
+    if num_frames == 0:
+        return
+    result.info.animated = true
+    result.info.frame_count = (usize)num_frames
+    result.info.loop_count = num_plays
+
+# mark: Frames ================================================================================
+
+## A frame's fcTL chunk.
+struct FrameControl:
+    var width: usize
+    var height: usize
+    var x_offset: usize
+    var y_offset: usize
+    var delay_num: u16
+    var delay_den: u16
+    var dispose_op: u8
+    var blend_op: u8
+
+## What the walk found: the frames shown, the image data of each (its pieces), and
+## whether the default image is hidden.
+struct Walked:
+    var frames: Frame[]
+    var count: usize
+    var pieces: Piece[]
+    var piece_count: usize
+    ## The default image's pieces, when it is hidden.
+    var hidden_first: usize
+    var hidden_count: usize
+    var hidden: bool
+    var complete: bool
+
+    func release():
+        if self.frames.length > 0:
+            free(self.frames) in memory.heap
+        if self.pieces.length > 0:
+            free(self.pieces) in memory.heap
+
+    ## A piece of image data.
+    func add_piece(piece: Piece) -> !:
+        if self.piece_count == self.pieces.length:
+            let larger = try new Piece[self.piece_count * 2 + 16] --- in memory.heap
+            memory.copy(larger, self.pieces, self.piece_count)
+            if self.pieces.length > 0:
+                free(self.pieces) in memory.heap
+            self.pieces = larger
+        self.pieces[self.piece_count] = piece
+        self.piece_count += 1
+
+    ## A frame shown, of `control`, its data the pieces from `first`.
+    func add_frame(control: FrameControl, first: usize) -> !:
+        if self.count == self.frames.length:
+            let larger = try new Frame[self.count * 2 + 4] --- in memory.heap
+            memory.copy(larger, self.frames, self.count)
+            if self.frames.length > 0:
+                free(self.frames) in memory.heap
+            self.frames = larger
+        let denominator = (u32)control.delay_den if control.delay_den != 0 else 100
+        self.frames[self.count] = Frame(left = control.x_offset, top = control.y_offset, width = control.width, height = control.height, delay_numerator = control.delay_num, delay_denominator = control.delay_den,
+                                        duration = (u32)control.delay_num * 1000 // denominator, disposal = Disposal.background if control.dispose_op == dispose_op_background else Disposal.previous if control.dispose_op == dispose_op_previous else Disposal.keep,
+                                        blend = control.blend_op == blend_op_over, first_piece = first, piece_count = self.piece_count - first)
+        self.count += 1
+
+## A chunk: its type's position, its data's, and its length.
+struct Chunk:
+    var name: str
+    var start: usize
+    var body: const u8[]
+
+## The chunk at `at`, none where the file ends inside it.
+func chunk_at(data: const u8[], at: usize) -> Chunk?:
+    if at + 12 > data.length:
+        return none
+    let length = (usize)read_u32(data, at)
+    if length > data.length - at - 12:
+        return none
+    return Chunk(name = (str)data[at + 4..<at + 8], start = at + 4, body = data[at + 8..<at + 8 + length])
+
+## png_ensure_sequence_number: an fcTL's or fdAT's sequence number, the next in order.
+func ensure_sequence_number(body: const u8[], next_seq: u32*) -> !:
+    if body.length < 4:
+        error(corrupt, "invalid fcTL or fdAT chunk")
+    if read_u32(body, 0) != *next_seq:
+        error(corrupt, "fcTL or fdAT chunk with out-of-order sequence number")
+    *next_seq += 1
+
+## png_handle_fcTL with png_set_next_frame_fcTL: the frame control of `body`, or none when
+## libpng ignores it (a wrong length; the first frame's not at the origin or not of the
+## image's size). Out-of-range values and bad operations are errors.
+func read_fctl(body: const u8[], first_frame: bool, header: const Info*, opaque: bool) -> FrameControl?!:
+    if body.length != 26:
+        return none
+    var control = FrameControl(width = (usize)(try uint_31(body, 4)), height = (usize)(try uint_31(body, 8)), x_offset = (usize)(try uint_31(body, 12)), y_offset = (usize)(try uint_31(body, 16)), delay_num = (u16)read_u16(body, 20),
+                               delay_den = (u16)read_u16(body, 22), dispose_op = body[24], blend_op = body[25])
+    if first_frame and (control.x_offset != 0 or control.y_offset != 0):
+        return none
+    if first_frame and (control.width != header.width or control.height != header.height):
+        return none
+    # png_ensure_fcTL_is_valid.
+    if control.width == 0 or control.height == 0:
+        error(corrupt, "invalid width or height in fcTL")
+    if control.width + control.x_offset > header.width or control.height + control.y_offset > header.height:
+        error(corrupt, "dimensions of a frame are greater than the ones in IHDR")
+    if control.dispose_op > dispose_op_previous or control.blend_op > blend_op_over:
+        error(corrupt, "invalid dispose_op or blend_op in fcTL")
+    # OVER is meaningless for an opaque image.
+    if control.blend_op == blend_op_over and opaque:
+        control.blend_op = blend_op_source
+    return control
+
+## The big-endian 16-bit number at `at`.
+func read_u16(data: const u8[], at: usize) -> u32:
+    return ((u32)data[at] << 8) | (u32)data[at + 1]
+
+# mark: The walk ==============================================================================
+
+## The chunks up to and with the first run of IDAT chunks, as `parse` checks them (each
+## chunk's CRC but IDAT's, which decoding checks), and where the run ends.
+func parse_through_idat(data: const u8[], result: Parsed*) -> usize!:
+    if data.length < 8 or (str)data[..<8] != (str)signature:
+        error(corrupt, "invalid PNG signature")
+    var walk = Walk()
+    var at: usize = 8
+    while true:
+        # The data may end after the image data: libpng reads no further than it needs.
+        let found = chunk_at(data, at) else break
+        if found.name != "IDAT" and walk.pixels:
+            break
+        if found.name != "IDAT" and not chunk_crc_ok(data, found.start, found.body.length):
+            error(corrupt, "PNG CRC mismatch")
+        try take_chunk(result, &walk, found.name, found.body, found.start, found.body.length)
+        if walk.end:
+            break
+        at = found.start + found.body.length + 8
+    if not walk.pixels:
+        error(corrupt, "PNG has no image data")
+    result.info.alpha = result.info.color == 4 or result.info.color == 6 or result.transparency.length > 0
+    if not result.info.animated:
+        result.info.frame_count = 1
+    return at
+
+## Walk the frames of the PNG in `data` into `parsed` (its header, and the default image's
+## IDAT chunks) and the frames. Fails where libpng's png_read_info fails; the frames after
+## the image data stop at the first failure, the walk then incomplete.
+func walk_frames(data: const u8[], parsed: Parsed*) -> Walked!:
+    var walked = Walked()
+    errdefer walked.release()
+    var at = try parse_through_idat(data, parsed)
+    let header = &parsed.info
+    let opaque = (header.color & 4) == 0 and parsed.transparency.length == 0
+    # Up to the image data (png_read_info): the first frame's fcTL, the sequence numbers.
+    var next_seq: u32 = 0
+    var first_control: FrameControl? = none
+    var before: usize = 8
+    while before < parsed.pieces[0].start - 8:
+        let found = chunk_at(data, before) else trap("the chunks before IDAT were read")
+        if found.name == "fcTL":
+            try ensure_sequence_number(found.body, &next_seq)
+            if first_control == none:
+                first_control = try read_fctl(found.body, true, header, opaque)
+        elif found.name == "fdAT":
+            # Out of place: checked, then ignored.
+            try ensure_sequence_number(found.body, &next_seq)
+        before = found.start + found.body.length + 8
+    # The default image: the IDAT chunks in a row.
+    let idat_first = walked.piece_count
+    for index in 0..<parsed.count:
+        try walked.add_piece(parsed.pieces[index])
+    if not header.animated:
+        # A still PNG: one frame.
+        try walked.add_frame(FrameControl(width = header.width, height = header.height), idat_first)
+        walked.complete = true
+        return walked
+    if let control = first_control:
+        try walked.add_frame(control, idat_first)
+    else:
+        walked.hidden = true
+        walked.hidden_first = idat_first
+        walked.hidden_count = walked.piece_count - idat_first
+    # The frames after the image data, frame by frame.
+    let total = header.frame_count + (1 if walked.hidden else 0)
+    walked.complete = true
+    for frame_index in 1..<total:
+        walk_frame(data, &at, frame_index, &next_seq, header, opaque, &walked) catch:
+            walked.complete = false
+            recover ()
+        if not walked.complete:
+            break
+    return walked
+
+## png_read_frame_head and png_read_image's chunks for frame `frame_index`: its fcTL and its
+## fdAT chunks; the chunks between frames skipped. Fails where libpng fails.
+func walk_frame(data: const u8[], at: usize*, frame_index: usize, next_seq: u32*, header: const Info*, opaque: bool, walked: Walked*) -> !:
+    var have_chunk_after_dat = false
+    var control: FrameControl? = none
+    while true:
+        let found = chunk_at(data, *at) else error(corrupt, "PNG ends inside its animation")
+        *at = found.start + found.body.length + 8
+        if found.name == "IDAT":
+            # Trailing IDAT chunks of the first frame are skipped.
+            if have_chunk_after_dat or frame_index > 1:
+                error(corrupt, "out of place IDAT")
+        elif found.name == "fcTL":
+            try ensure_sequence_number(found.body, next_seq)
+            # A second fcTL in a frame is skipped.
+            if control == none:
+                control = try read_fctl(found.body, false, header, opaque)
+            have_chunk_after_dat = true
+        elif found.name == "fdAT":
+            try ensure_sequence_number(found.body, next_seq)
+            if not have_chunk_after_dat and frame_index > 1:
+                # A trailing fdAT of the frame before.
+                continue
+            let frame = control else error(corrupt, "out of place fdAT")
+            # The frame's data: this fdAT and those right after it in sequence. libpng reads
+            # them as the zlib stream asks for more, so one out of sequence ends the data
+            # here, and fails only if the next frame comes to it.
+            let first = walked.piece_count
+            try walked.add_piece(Piece(start = found.start + 8, length = found.body.length - 4))
+            while let more = chunk_at(data, *at):
+                if more.name != "fdAT" or more.body.length < 4 or read_u32(more.body, 0) != *next_seq:
+                    break
+                *next_seq += 1
+                try walked.add_piece(Piece(start = more.start + 8, length = more.body.length - 4))
+                *at = more.start + more.body.length + 8
+            try walked.add_frame(frame, first)
+            return
