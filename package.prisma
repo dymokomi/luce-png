@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-png" {
     str owner = "dymokomi"
-    str version = "0.5.0"
+    str version = "0.6.0"
     str kind = "package"
     str language = "luce-base"
     str description = "A fast multithreaded PNG decoder and encoder for Luce/Base: every colour type and depth, 8- and 16-bit RGBA, row bands, streamed encoding with parallel deflate."
@@ -10,19 +10,19 @@ def package "luce-png" {
 
     def dependency "luce-raster" {
         str owner = "dymokomi"
-        str version = "^0.3.0"
+        str version = "^0.4.0"
         str path = "../luce-raster"
     }
 
     def dependency "luce-compress" {
         str owner = "dymokomi"
-        str version = "^0.5.0"
+        str version = "^0.6.0"
         str path = "../luce-compress"
     }
 
     def dependency "luce-std" {
         str owner = "dymokomi"
-        str version = "^0.4.0"
+        str version = "^0.5.0"
         str path = "../luce-std"
     }
 }

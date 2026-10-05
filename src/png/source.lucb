@@ -109,7 +109,7 @@ struct Feed:
     var failure_code: ErrorCode
     var failure: str
 
-    func open(read: ReadAt, source: void*?, size: u64, parsed: const Parsed*) -> Feed!:
+    static func open(read: ReadAt, source: void*?, size: u64, parsed: const Parsed*) -> Feed!:
         return Feed(read = read, source = source, size = size, parsed = parsed, block = try new u8[feed_block] --- in memory.heap,
                     block_at = 0, block_length = 0, chunk = 0, offset = 0, crc = flate.crc32(b"IDAT"), base = 0, tail_length = 0,
                     failed = false, failure_code = corrupt, failure = "")

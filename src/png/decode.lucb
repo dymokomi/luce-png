@@ -51,7 +51,7 @@ struct Layout:
     var palette: const u8[]
     var transparency: const u8[]
 
-    func of(p: const Parsed*) -> Layout:
+    static func of(p: const Parsed*) -> Layout:
         let nc = source_channels(p.info.color)
         return Layout(width = p.info.width, height = p.info.height, bits = p.info.bits, color = p.info.color, channels = nc, bpp = (nc * p.info.bits + 7) // 8, palette = p.palette, transparency = p.transparency)
 

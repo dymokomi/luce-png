@@ -46,7 +46,7 @@ pub struct Encoder:
     var finished: bool
 
     ## Start a `width` x `height` PNG of `pixels` rows at the end of `output`.
-    pub func begin(width: usize, height: usize, pixels: Format, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> Encoder!:
+    pub static func begin(width: usize, height: usize, pixels: Format, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> Encoder!:
         if width == 0 or height == 0 or width > 1000000 or height > 1000000:
             error(invalid, "invalid dimensions or channel count")
         if options.level < 0 or options.level > 9 or options.filter < -1 or options.filter > 4:
