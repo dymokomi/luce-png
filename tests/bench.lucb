@@ -19,7 +19,7 @@ pub func main(arguments: str[]) -> i32!:
     let file = try files.read((c.str)arguments[1])
     defer file.release()
     # A raster holds mutable bytes, so the benchmark lends it a copy.
-    let encoded = try alloc u8[file.value.length] in memory.heap
+    let encoded = try new u8[file.value.length] --- in memory.heap
     defer free(encoded) in memory.heap
     memory.copy(encoded, file.value, file.value.length)
     let repeats = (usize)number(arguments, 3, 1)
@@ -27,7 +27,7 @@ pub func main(arguments: str[]) -> i32!:
     let raster_mode = arguments.length > 5 and arguments[5] == "raster"
     let threads = (usize)number(arguments, 6, 0)
     let info = try png.info(encoded)
-    let pixels = try alloc u8[info.width * info.height * 4] in memory.heap
+    let pixels = try new u8[info.width * info.height * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     var raster = Raster()
     var best: u64 = 0

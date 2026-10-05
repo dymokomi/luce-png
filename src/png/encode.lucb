@@ -46,7 +46,7 @@ pub struct Encoder:
     var finished: bool
 
     ## Start a `width` x `height` PNG of `pixels` rows at the end of `output`.
-    pub static func begin(width: usize, height: usize, pixels: Format, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> Encoder!:
+    pub func begin(width: usize, height: usize, pixels: Format, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> Encoder!:
         if width == 0 or height == 0 or width > 1000000 or height > 1000000:
             error(invalid, "invalid dimensions or channel count")
         if options.level < 0 or options.level > 9 or options.filter < -1 or options.filter > 4:
@@ -78,20 +78,20 @@ pub struct Encoder:
         return e
 
     ## Push `count` rows of 8-bit pixels, tightly packed.
-    pub mutating func write_rows(pixels: const u8[], count: usize) -> !:
+    pub func write_rows(pixels: const u8[], count: usize) -> !:
         if self.deep:
             error(invalid, "16-bit PNG rows go through write_rows16")
         try self.push(pixels, count, false)
 
     ## Push `count` rows of 16-bit samples, tightly packed.
-    pub mutating func write_rows16(pixels: const u16[], count: usize) -> !:
+    pub func write_rows16(pixels: const u16[], count: usize) -> !:
         if not self.deep:
             error(invalid, "8-bit PNG rows go through write_rows")
         if pixels.length < count * self.width * self.channels:
             error(invalid, "PNG rows are shorter than the width")
         try self.push(u8[]((u8*)pixels.data, pixels.length * 2), count, true)
 
-    mutating func push(pixels: const u8[], count: usize, swap: bool) -> !:
+    func push(pixels: const u8[], count: usize, swap: bool) -> !:
         if self.finished or self.received + count > self.height:
             error(invalid, "more PNG rows than the picture has")
         if pixels.length < count * self.row_bytes:
@@ -114,7 +114,7 @@ pub struct Encoder:
                     self.received += used
                     continue
             if self.rows.length == 0:
-                self.rows = try alloc u8[group_rows * self.row_bytes] in memory.heap
+                self.rows = try new u8[group_rows * self.row_bytes] --- in memory.heap
             let rows = group_rows - self.buffered if group_rows - self.buffered < count - taken else count - taken
             let to = self.rows.data + self.buffered * self.row_bytes
             let source = pixels.data + taken * self.row_bytes
@@ -137,7 +137,7 @@ pub struct Encoder:
                 self.buffered = 0
 
     ## Filter and deflate `count` bands whose first row is at `source`, and append them.
-    mutating func encode_bands(source: const u8*, count: usize) -> !:
+    func encode_bands(source: const u8*, count: usize) -> !:
         var done: usize = 0
         while done < count:
             let n = self.group if done + self.group <= count else count - done
@@ -163,7 +163,7 @@ pub struct Encoder:
             done += n
 
     ## Complete the file once every row is in.
-    pub mutating func finish() -> !:
+    pub func finish() -> !:
         if self.finished:
             return
         if self.received != self.height:
@@ -180,7 +180,7 @@ pub struct Encoder:
         try chunk(self.output, "IEND", b"")
         self.finished = true
 
-    pub mutating func close():
+    pub func close():
         for i in 0..<self.outs.length:
             if self.outs[i].data.length > 0:
                 free(self.outs[i].data) in memory.heap
@@ -206,7 +206,7 @@ func encode_task(context: void*, index: usize):
     let first = band * e.band_rows
     let rows = e.band_rows if first + e.band_rows <= e.height else e.height - first
     let stride = e.row_bytes + 1
-    let raw = alloc u8[rows * stride] in memory.heap catch:
+    let raw = new u8[rows * stride] --- in memory.heap catch:
         out.failed = true
         return
     defer free(raw) in memory.heap
@@ -219,7 +219,7 @@ func encode_task(context: void*, index: usize):
     if out.data.length < bound:
         if out.data.length > 0:
             free(out.data) in memory.heap
-        out.data = alloc u8[bound] in memory.heap catch:
+        out.data = new u8[bound] --- in memory.heap catch:
             out.failed = true
             return
     out.used = flate.deflate_raw(raw, e.level, out.data, band + 1 == e.bands) catch:

@@ -134,7 +134,7 @@ func probed(image: Raster*, parsed: const Parsed*) -> !:
     image.transparency = parsed.transparency
     let base = 3 if i.color == 3 else source_channels(i.color)
     try image.standard(base + (1 if parsed.transparency.length > 0 else 0), .uint16 if i.bits == 16 else .uint8)
-    discard(try image.validate())
+    _ = try image.validate()
     image.file_format = "PNG"
 
 ## Decode a probed and allocated `image` into its f64 samples.
@@ -217,9 +217,9 @@ pub func encode(image: const Raster*, output: Buffer*, options: EncodeOptions = 
     let batch: usize = 32
     let row = image.width * nc
     let top = 65535.0 if deep else 255.0
-    let bytes = try alloc u8[batch * row] in memory.heap
+    let bytes = try new u8[batch * row] --- in memory.heap
     defer free(bytes) in memory.heap
-    let words = try alloc u16[batch * row] in memory.heap
+    let words = try new u16[batch * row] --- in memory.heap
     defer free(words) in memory.heap
     var y: usize = 0
     while y < image.height:

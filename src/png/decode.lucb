@@ -51,7 +51,7 @@ struct Layout:
     var palette: const u8[]
     var transparency: const u8[]
 
-    static func of(p: const Parsed*) -> Layout:
+    func of(p: const Parsed*) -> Layout:
         let nc = source_channels(p.info.color)
         return Layout(width = p.info.width, height = p.info.height, bits = p.info.bits, color = p.info.color, channels = nc, bpp = (nc * p.info.bits + 7) // 8, palette = p.palette, transparency = p.transparency)
 
@@ -213,15 +213,15 @@ func band_task(context: void*, index: usize):
     let first = band * p.band_rows
     let rows = p.band_rows if first + p.band_rows <= l.height else l.height - first
     let stride = l.row_bytes(l.width) + 1
-    let raw = alloc u8[rows * stride] in memory.heap catch:
-        discard(job.failed.swap(1))
+    let raw = new u8[rows * stride] --- in memory.heap catch:
+        _ = job.failed.swap(1)
         return
     defer free(raw) in memory.heap
     let used = flate.inflate_raw(p.piece(job.data, band + 1), raw) catch:
-        discard(job.failed.swap(1))
+        _ = job.failed.swap(1)
         return
     if used != p.pieces[band + 1].length:
-        discard(job.failed.swap(1))
+        _ = job.failed.swap(1)
         return
     job.adlers[band] = flate.adler32(raw)
     for r in 0..<rows:
@@ -229,14 +229,14 @@ func band_task(context: void*, index: usize):
         let kind = row[0]
         # A band's first row stands alone: None or Sub only.
         if r == 0 and kind > 1:
-            discard(job.failed.swap(1))
+            _ = job.failed.swap(1)
             return
         let above: const u8*? = none if r == 0 else raw.data + (r - 1) * stride + 1
         if not unfilter(kind, row + 1, above, stride - 1, l.bpp):
-            discard(job.failed.swap(1))
+            _ = job.failed.swap(1)
             return
         if not convert_row(l, row + 1, l.width, first + r, 0, 1, job.target):
-            discard(job.failed.swap(1))
+            _ = job.failed.swap(1)
             return
 
 ## Decode a file with a consistent `luPD` chunk band by band on every processor;
@@ -259,7 +259,7 @@ func parallel_decode(data: const u8[], p: const Parsed*, l: const Layout*, targe
         # Row callbacks: a few bands a thread at a time into one buffer, handed on.
         let pixel: usize = 8 if target.deep else 4
         let per = threads * 2
-        let buffer = try alloc u8[per * p.band_rows * l.width * pixel] in memory.heap
+        let buffer = try new u8[per * p.band_rows * l.width * pixel] --- in memory.heap
         defer free(buffer) in memory.heap
         target.bytes = buffer
         var band: usize = 0
@@ -357,14 +357,14 @@ func follow_rows(context: void*?):
             let above: const u8*? = none if row == 0 else to - length
             if not unfilter_span(kind, to, above, x, end, l.bpp):
                 f.failure = "invalid PNG row filter"
-                discard(f.failed.swap(1))
+                _ = f.failed.swap(1)
                 return
             f.done[row].store(end, .release)
             x = end
         if not f.direct:
             if not convert_row(l, to, l.width, row, 0, 1, f.target):
                 f.failure = "PNG palette index out of range"
-                discard(f.failed.swap(1))
+                _ = f.failed.swap(1)
                 return
 
 ## The checksum worker: the Adler-32 of the inflated bytes as they arrive.
@@ -410,7 +410,7 @@ func sequential_decode(data: const u8[], p: const Parsed*, l: const Layout*, tar
     let expected = scanline_bytes(l, p.info.interlaced)
     if expected > options.max_bytes:
         error(invalid, "PNG scanlines exceed byte limit")
-    let raw = try alloc u8[expected] in memory.heap
+    let raw = try new u8[expected] --- in memory.heap
     defer free(raw) in memory.heap
     let stride = l.row_bytes(l.width) + 1
     let pipelined = threads > 1 and not p.info.interlaced and target.sink == none
@@ -435,7 +435,7 @@ func pipelined_inflate(stream: const u8[], raw: u8[], l: const Layout*, target: 
     let direct = target.bytes.length > 0 and l.bits == 8 and l.color == 6
     var clean: u8[]
     if not direct:
-        clean = try alloc u8[l.height * length] in memory.heap
+        clean = try new u8[l.height * length] --- in memory.heap
     defer release(clean)
     let done = try new Progress[l.height] in memory.heap
     defer free(done) in memory.heap
@@ -452,9 +452,9 @@ func pipelined_inflate(stream: const u8[], raw: u8[], l: const Layout*, target: 
         started += 1
     let used = flate.inflate_raw(stream[2..], raw, follow_progress, (void*)&f) catch failure:
         f.finished.store(1, .release)
-        discard(f.failed.swap(1))
+        _ = f.failed.swap(1)
         for i in 0..<started:
-            discard(handles[i].join() else ())
+            _ = handles[i].join() else ()
         error(failure.code, failure.message)
     f.finished.store(1, .release)
     # This thread helps with the rows that are left.
@@ -473,7 +473,7 @@ func check_adler(stream: const u8[], at: usize, adler: u32) -> !:
         error(corrupt, "zlib Adler checksum mismatch")
 
 func join_pieces(data: const u8[], p: const Parsed*, total: usize) -> const u8[]!:
-    let joined = try alloc u8[total] in memory.heap
+    let joined = try new u8[total] --- in memory.heap
     var at: usize = 0
     for i in 0..<p.count:
         let piece = p.piece(data, i)
@@ -517,11 +517,11 @@ let streamed_window: usize = 1048576
 func streamed_rows(data: const u8[], p: const Parsed*, l: const Layout*, target: Target*) -> !:
     let stride = l.row_bytes(l.width) + 1
     let pixel: usize = 8 if target.deep else 4
-    let through = try alloc u8[streamed_window] in memory.heap
+    let through = try new u8[streamed_window] --- in memory.heap
     defer free(through) in memory.heap
-    let lines = try alloc u8[stride * 2] in memory.heap
+    let lines = try new u8[stride * 2] --- in memory.heap
     defer free(lines) in memory.heap
-    let group = try alloc u8[streamed_group * l.width * pixel] in memory.heap
+    let group = try new u8[streamed_group * l.width * pixel] --- in memory.heap
     defer free(group) in memory.heap
     target.bytes = group
     target.first_row = 0
@@ -603,7 +603,7 @@ func rows_in_order(p: const Parsed*, l: const Layout*, raw: u8[], target: Target
     let group: usize = 64
     var buffer: u8[]
     if target.sink != none:
-        buffer = try alloc u8[group * l.width * pixel] in memory.heap
+        buffer = try new u8[group * l.width * pixel] --- in memory.heap
         target.bytes = buffer
         target.first_row = 0
     defer release(buffer)
@@ -655,7 +655,7 @@ func interlaced_rows(l: const Layout*, raw: u8[], target: Target*) -> !:
             offset += rowbytes + 1
     let pixel: usize = 8 if target.deep else 4
     let group: usize = 64
-    let buffer = try alloc u8[group * l.width * pixel] in memory.heap
+    let buffer = try new u8[group * l.width * pixel] --- in memory.heap
     defer free(buffer) in memory.heap
     target.bytes = buffer
     var first: usize = 0
@@ -714,10 +714,10 @@ func early_progress(context: void*?, produced: usize):
 ## converted to RGBA for the sink.
 func first_pass(early: EarlyPass*, w: usize, h: usize, stride: usize) -> !:
     let sink = early.sink else return
-    let lines = try alloc u8[stride * h] in memory.heap
+    let lines = try new u8[stride * h] --- in memory.heap
     defer free(lines) in memory.heap
     memory.copy(lines, early.raw, stride * h)
-    let pixels = try alloc u8[w * h * 4] in memory.heap
+    let pixels = try new u8[w * h * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     var small = *early.layout
     small.width = w

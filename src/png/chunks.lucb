@@ -22,7 +22,7 @@ struct Parsed:
     ## A file walked in place (png/source): its palette and transparency, kept.
     var kept: u8[]
 
-    mutating func close():
+    func close():
         if self.pieces.length > 0:
             free(self.pieces) in memory.heap
         var empty: Piece[]
@@ -74,7 +74,7 @@ func parse(data: const u8[], check_idat: bool) -> Parsed!:
         let start = reader.position
         let name = (str)(try reader.take(4))
         let body = try reader.take(size)
-        discard(try reader.uint(4))
+        _ = try reader.uint(4)
         if name != "IDAT" or check_idat:
             if not chunk_crc_ok(data, start, size):
                 error(corrupt, "PNG CRC mismatch")
@@ -101,7 +101,7 @@ func parse_head(data: const u8[]) -> Parsed!:
         if name == "IDAT" or name == "IEND":
             break
         let body = try reader.take(size)
-        discard(try reader.uint(4))
+        _ = try reader.uint(4)
         if not chunk_crc_ok(data, start, size):
             error(corrupt, "PNG CRC mismatch")
         try take_chunk(&result, &walk, name, body, start, size)
@@ -165,7 +165,7 @@ func take_chunk(result: Parsed*, walk: Walk*, name: str, body: const u8[], start
             error(corrupt, "invalid PNG IDAT order")
         walk.pixels = true
         if result.count == result.pieces.length:
-            let grown = try alloc Piece[result.count * 2 + 16] in memory.heap
+            let grown = try new Piece[result.count * 2 + 16] --- in memory.heap
             for i in 0..<result.count:
                 grown[i] = result.pieces[i]
             if result.pieces.length > 0:

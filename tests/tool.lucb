@@ -38,12 +38,12 @@ func take_coarse(context: void*?, width: usize, height: usize, pixels: const u8[
     coarse.calls += 1
 
 func ignore_rows(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !:
-    discard(context)
+    _ = context
 
 ## `ReadAt` over an open file.
 func read_file(context: void*?, at: u64, into: u8[]) -> usize!:
     let file = (files.File*)(context else return 0)
-    discard(try file.seek((i64)at))
+    _ = try file.seek((i64)at)
     return try file.read(into)
 
 func number(arguments: str[], index: usize, fallback: u64) -> u64:
@@ -94,11 +94,11 @@ pub func main(arguments: str[]) -> i32!:
                 print("rows out of order or missing")
                 return 1
         elif deep:
-            let out = try alloc u16[w * h * 4] in memory.heap
+            let out = try new u16[w * h * 4] --- in memory.heap
             try png.decode_rgba16(data, out, options)
             try raw.put(u8[]((u8*)out.data, out.length * 2))
         else:
-            let out = try alloc u8[w * h * 4] in memory.heap
+            let out = try new u8[w * h * 4] --- in memory.heap
             try png.decode_rgba8(data, out, options)
             try raw.put(out)
         try files.write((c.str)arguments[3], raw.view())
@@ -110,7 +110,7 @@ pub func main(arguments: str[]) -> i32!:
     let stream = arguments[7] == "stream"
     let threads = (usize)number(arguments, 8, 0)
     let band_rows = (usize)number(arguments, 9, 0)
-    let rgba = try alloc u16[w * h * 4] in memory.heap
+    let rgba = try new u16[w * h * 4] --- in memory.heap
     try png.decode_rgba16(data, rgba)
     let names: str[8] = ["gray8", "ga8", "rgb8", "rgba8", "gray16", "ga16", "rgb16", "rgba16"]
     let formats: png.Format[8] = [.gray8, .gray_alpha8, .rgb8, .rgba8, .gray16, .gray_alpha16, .rgb16, .rgba16]
@@ -121,8 +121,8 @@ pub func main(arguments: str[]) -> i32!:
     let channels: usize = index % 4 + 1
     let deep = index >= 4
     let picks: usize[16] = [0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 2, 0, 0, 1, 2, 3]
-    let bytes = try alloc u8[w * h * channels] in memory.heap
-    let words = try alloc u16[w * h * channels] in memory.heap
+    let bytes = try new u8[w * h * channels] --- in memory.heap
+    let words = try new u16[w * h * channels] --- in memory.heap
     for p in 0..<w * h:
         for k in 0..<channels:
             let v = rgba[p * 4 + picks[(channels - 1) * 4 + k]]

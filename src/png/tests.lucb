@@ -120,13 +120,13 @@ test "a PNG from another encoder streams its rows through an inflate window":
     let width: usize = 1200
     let height: usize = 400
     let stride = width * 3 + 1
-    let raw = try alloc u8[stride * height] in memory.heap
+    let raw = try new u8[stride * height] --- in memory.heap
     defer free(raw) in memory.heap
     for y in 0..<height:
         raw[y * stride] = (u8)(y % 5)
         for x in 1..<stride:
             raw[y * stride + x] = (u8)((x * 7 + y * 13 + (x * y) // 97) % 256)
-    let packed = try alloc u8[raw.length + 4096] in memory.heap
+    let packed = try new u8[raw.length + 4096] --- in memory.heap
     defer free(packed) in memory.heap
     let used = try flate.deflate_zlib(raw, 6, packed)
     var out = Buffer()
@@ -143,10 +143,10 @@ test "a PNG from another encoder streams its rows through an inflate window":
     try chunk(&out, "IDAT", packed[third..<2 * third])
     try chunk(&out, "IDAT", packed[2 * third..<used])
     try chunk(&out, "IEND", b"")
-    let whole = try alloc u8[width * height * 4] in memory.heap
+    let whole = try new u8[width * height * 4] --- in memory.heap
     defer free(whole) in memory.heap
     try decode_rgba8(out.view(), whole)
-    var rows = Collected(pixels = try alloc u8[width * height * 4] in memory.heap, next = 0, calls = 0)
+    var rows = Collected(pixels = try new u8[width * height * 4] --- in memory.heap, next = 0, calls = 0)
     defer free(rows.pixels) in memory.heap
     try decode_rows(out.view(), collect, (void*)&rows)
     assert(rows.next == height and rows.calls == (height + 63) // 64)
@@ -187,10 +187,10 @@ func read_held(context: void*?, at: u64, into: u8[]) -> usize!:
 ## `data` decoded through `decode_rows_at` as `decode_rows` decodes it; whether the rows agree.
 func same_rows_at(data: const u8[], width: usize, height: usize, deep: bool) -> bool!:
     let pixel: usize = 8 if deep else 4
-    var expected = Collected(pixels = try alloc u8[width * height * pixel] in memory.heap, next = 0, calls = 0)
+    var expected = Collected(pixels = try new u8[width * height * pixel] --- in memory.heap, next = 0, calls = 0)
     defer free(expected.pixels) in memory.heap
     try decode_rows(data, collect, (void*)&expected, deep)
-    var rows = Collected(pixels = try alloc u8[width * height * pixel] in memory.heap, next = 0, calls = 0)
+    var rows = Collected(pixels = try new u8[width * height * pixel] --- in memory.heap, next = 0, calls = 0)
     defer free(rows.pixels) in memory.heap
     var held = Held(data = data, reads = 0, largest = 0)
     try decode_rows_at(read_held, (void*)&held, (u64)data.length, collect, (void*)&rows, deep)
@@ -207,7 +207,7 @@ test "a file read in pieces decodes as the file whole, its banded and general pa
     let width: usize = 900
     let height: usize = 700
     let stride = width * 4 + 1
-    let raw = try alloc u8[stride * height] in memory.heap
+    let raw = try new u8[stride * height] --- in memory.heap
     defer free(raw) in memory.heap
     var seed: u32 = 12345
     for y in 0..<height:
@@ -215,7 +215,7 @@ test "a file read in pieces decodes as the file whole, its banded and general pa
         for x in 1..<stride:
             seed = seed *% 1103515245 +% 12345
             raw[y * stride + x] = (u8)(seed >> 24)
-    let packed = try alloc u8[raw.length + 65536] in memory.heap
+    let packed = try new u8[raw.length + 65536] --- in memory.heap
     defer free(packed) in memory.heap
     let used = try flate.deflate_zlib(raw, 1, packed)
     var out = Buffer()
@@ -237,7 +237,7 @@ test "a file read in pieces decodes as the file whole, its banded and general pa
     assert(try same_rows_at(out.view(), width, height, false))
     assert(try same_rows_at(out.view(), width, height, true))
     # This encoder's bands, decoded a group at a time on every processor.
-    let pixels = try alloc u8[width * height * 4] in memory.heap
+    let pixels = try new u8[width * height * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     for i in 0..<pixels.length:
         pixels[i] = raw[(i // (width * 4)) * stride + 1 + i % (width * 4)]
@@ -246,11 +246,11 @@ test "a file read in pieces decodes as the file whole, its banded and general pa
     try encode_rgba8(pixels, width, height, &banded, EncodeOptions(level = 1, band_rows = 16))
     assert(try same_rows_at(banded.view(), width, height, false))
     # A damaged IDAT chunk, one in the middle, fails on its CRC.
-    let damaged = try alloc u8[out.view().length] in memory.heap
+    let damaged = try new u8[out.view().length] --- in memory.heap
     defer free(damaged) in memory.heap
     memory.copy(damaged, out.view(), damaged.length)
     damaged[damaged.length // 2] ^= 1
-    var rows = Collected(pixels = try alloc u8[width * height * 4] in memory.heap, next = 0, calls = 0)
+    var rows = Collected(pixels = try new u8[width * height * 4] --- in memory.heap, next = 0, calls = 0)
     defer free(rows.pixels) in memory.heap
     var held = Held(data = damaged, reads = 0, largest = 0)
     var failed = false
@@ -301,12 +301,12 @@ test "the start of a file up to its first IDAT probes as the file whole":
         have = need
     var whole = Raster()
     defer whole.close()
-    whole.encoded = try alloc u8[data.length] in memory.heap
+    whole.encoded = try new u8[data.length] --- in memory.heap
     memory.copy(whole.encoded, data, data.length)
     try probe(&whole)
     var head = Raster()
     defer head.close()
-    head.encoded = try alloc u8[have] in memory.heap
+    head.encoded = try new u8[have] --- in memory.heap
     memory.copy(head.encoded, data, have)
     try probe_head(&head)
     assert(head.width == 4 and head.height == 2 and head.channels.length == whole.channels.length and head.photo == 3)
