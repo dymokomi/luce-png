@@ -13,12 +13,14 @@
 #       whole canvas, as Ladybird's PNG loader pushes each frame. A hidden default image is
 #       decoded and discarded before the first frame, as libpng reads it.
 #
-#       OVER is straight-alpha compositing in the integers of apngdis's BlendOver (by the
-#       APNG patch's author): an opaque pixel replaces, a transparent one leaves the canvas,
-#       and otherwise each channel is the alpha-weighted average, rounded down. Ladybird draws
-#       through Skia's float pipeline, which can differ by one in a channel.
+#       Frames are drawn as Ladybird's PNG loader draws them, with its Painter into a canvas
+#       of straight alpha: through Skia's float raster pipeline (`skia_draw`), SOURCE as
+#       Skia's Copy and OVER as its SourceOver, a "previous" disposal restoring the area by a
+#       Copy of what was under the frame. The pipeline premultiplies and unpremultiplies, so a
+#       transparent pixel drawn keeps no color, as in Ladybird.
 #
-#       A still PNG is an animation of one frame.
+#       A still PNG is an animation of one frame, its image as it decodes (Ladybird draws
+#       nothing for it).
 #
 #==============================================================================================
 
@@ -172,19 +174,21 @@ pub struct Animation:
         var target = Target(bytes = self.frame_pixels[..<width * height * 4])
         try rows_in_order(&frame, &l, raw, &target)
 
-    ## Draw the decoded frame into its rectangle, replacing it or composited over it.
+    ## Draw the decoded frame into its rectangle, as Skia's Copy (SOURCE) or SourceOver (OVER);
+    ## a still PNG's image is the canvas as it decodes.
     func draw(frame: Frame):
         let width = self.info.width
+        if not self.info.animated:
+            memory.copy(self.canvas, self.frame_pixels, self.canvas.length)
+            return
         for y in 0..<frame.height:
             let row = self.canvas.data + ((frame.top + y) * width + frame.left) * 4
             let source = self.frame_pixels.data + y * frame.width * 4
-            if not frame.blend:
-                memory.copy(u8[](row, frame.width * 4), u8[](source, frame.width * 4), frame.width * 4)
-                continue
             for x in 0..<frame.width:
-                blend_over(row + x * 4, source + x * 4)
+                skia_draw(row + x * 4, source + x * 4, frame.blend)
 
-    ## Dispose of `frame`, the last one drawn, before the next is drawn over it.
+    ## Dispose of `frame`, the last one drawn, before the next is drawn over it: its area
+    ## cleared to transparent, or drawn back (a Copy) from what was under it.
     func dispose(frame: Frame):
         let width = self.info.width
         match frame.disposal:
@@ -197,8 +201,10 @@ pub struct Animation:
             .previous:
                 let span = frame.width * 4
                 for y in 0..<frame.height:
-                    let row = ((frame.top + y) * width + frame.left) * 4
-                    memory.copy(self.canvas[row..], self.saved[y * span..], span)
+                    let row = self.canvas.data + ((frame.top + y) * width + frame.left) * 4
+                    let saved = self.saved.data + y * span
+                    for x in 0..<frame.width:
+                        skia_draw(row + x * 4, saved + x * 4, false)
 
     ## Keep what is under `frame` before it is drawn, for its "previous" disposal.
     func save(frame: Frame) -> !:
@@ -209,18 +215,43 @@ pub struct Animation:
             let row = ((frame.top + y) * self.info.width + frame.left) * 4
             memory.copy(self.saved[y * span..], self.canvas[row..], span)
 
-## apngdis's BlendOver: the straight RGBA pixel `source` over `target`.
-func blend_over(target: u8*, source: const u8*):
-    let alpha = (u32)source[3]
-    if alpha == 255 or (alpha != 0 and target[3] == 0):
-        for c in 0..<(usize)4:
-            target[c] = source[c]
-        return
-    if alpha == 0:
-        return
-    let u = alpha * 255
-    let v = (255 - alpha) * (u32)target[3]
-    let al = u + v
+# mark: Skia's pipeline =========================================================================
+
+## 1/255 as an f32 (Skia's from_byte scale).
+let byte_scale: f32 = f32.bits(0x3b808081)
+
+## Skia's to_unorm(v, 255): clamped to 0..1, scaled and rounded to nearest, ties to even
+## (vcvtnq_u32_f32, _mm_cvtps_epi32).
+func to_unorm(v: f32) -> u8:
+    let clamped = 0.0 if not (v > 0.0) else 1.0 if v > 1.0 else v
+    let scaled = clamped * 255.0
+    let whole = (u32)scaled
+    let fraction = scaled - (f32)whole
+    if fraction > 0.5 or (fraction == 0.5 and (whole & 1) == 1):
+        return (u8)(whole + 1)
+    return (u8)whole
+
+## A straight RGBA pixel `source` drawn onto the straight RGBA pixel `target` through Skia's
+## highp raster pipeline, as Ladybird's Painter draws a straight-alpha bitmap into a
+## straight-alpha surface: both read as floats (each byte times 1/255) and premultiplied, then
+## blended (Copy: the source; SourceOver: the target times one less the source's alpha, a
+## fused multiply-add as on arm64, plus the source), unpremultiplied (times 1/alpha, or 0 for a
+## transparent result) and stored.
+func skia_draw(target: u8*, source: const u8*, over: bool):
+    let sa = (f32)source[3] * byte_scale
+    var a = sa
+    var color: f32[3] = ---
     for c in 0..<(usize)3:
-        target[c] = (u8)(((u32)source[c] * u + (u32)target[c] * v) // al)
-    target[3] = (u8)(al // 255)
+        color[c] = (f32)source[c] * byte_scale * sa
+    if over:
+        let da = (f32)target[3] * byte_scale
+        let inverse = 1.0 - sa
+        for c in 0..<(usize)3:
+            let dc = (f32)target[c] * byte_scale * da
+            color[c] = dc.mul_add(inverse, color[c])
+        a = da.mul_add(inverse, sa)
+    let reciprocal: f32 = 1.0 / a
+    let scale: f32 = reciprocal if reciprocal < f32.bits(0x7f800000) else 0.0
+    for c in 0..<(usize)3:
+        target[c] = to_unorm(color[c] * scale)
+    target[3] = to_unorm(a)

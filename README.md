@@ -61,15 +61,19 @@ Each `Frame` has its rectangle (`left`, `top`, `width`, `height`), `delay_numera
 `delay_denominator` as written, `duration` in milliseconds (a denominator of 0 is 100),
 `disposal` (`keep`, `background`, `previous`) and `blend` (OVER, else SOURCE). `render`
 disposes of the frame before, decodes the frame at its size and draws it into its
-rectangle; OVER composites straight alpha in the integers of apngdis's BlendOver (by the
-APNG patch's author). A still PNG is an animation of one frame.
+rectangle as Ladybird's Painter draws it into a straight-alpha canvas: through Skia's highp
+raster pipeline (premultiplied floats; Copy for SOURCE and for restoring a "previous"
+disposal, SourceOver with a fused multiply-add for OVER; unpremultiplied and rounded to
+nearest even), so its canvases are Ladybird's to the bit on arm64. A still PNG is an
+animation of one frame.
 
 `tests/fixtures/apng` (Ladybird's two APNG test inputs and 34 files from
 `gen_apng.py`: Pillow's animations in every disposal, blend and color type, and hand-built
 ones with offsets, odd delays, interlacing, chunks between frames, too many and too few
 frames, broken sequences, CRCs and fcTLs, files cut short) decode to libpng's frames,
 timing and failures, every composited frame's hash the same as the oracle's
-(`luce-browser-tools/oracles/luce-png/apng`). Of 1,500 mutations of them with valid CRCs,
+(`luce-browser-tools/oracles/luce-png/apng`, libpng with the same drawing steps), and every
+frame identical to the frames Ladybird's own ImageDecoder makes of them (`apng/ladybird`). Of 1,500 mutations of them with valid CRCs,
 1,477 agree; libpng also takes a frame whose zlib stream goes on past its rows, or a second
 tRNS chunk, with a warning, where luce-png refuses them. Like the still decoders,
 16-bit samples round to 8 bits where libpng's `png_set_strip_16` (Ladybird's) keeps the

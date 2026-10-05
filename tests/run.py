@@ -14,9 +14,9 @@
   read as libpng 1.6.50 reads them (expected.txt, from the libpng oracle);
 - the animated PNGs of tests/fixtures/apng (Ladybird's and gen_apng.py's, damaged ones
   among them) give the frames, timing and failures libpng 1.6.50 with the APNG patch
-  gives when driven as Ladybird's PNG loader drives it, every composited frame's hash the
-  same (expected.txt, from luce-browser-tools/oracles/luce-png/apng), in native, C and
-  diagnostic builds.
+  gives when driven as Ladybird's PNG loader drives it, every frame composited as its
+  Painter (Skia) composites it, the hashes the same (expected.txt, from
+  luce-browser-tools/oracles/luce-png/apng), in native, C and diagnostic builds.
 """
 import hashlib, os, random, struct, subprocess, tempfile
 from pathlib import Path
