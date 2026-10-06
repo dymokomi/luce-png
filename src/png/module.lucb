@@ -195,6 +195,9 @@ pub struct EncodeOptions:
     ## Rows a band (the unit compressed and decoded in parallel); 0 for about a
     ## megabyte of pixels.
     pub var band_rows: usize = 0
+    ## An ICC profile to embed as an iCCP chunk (zlib-compressed), telling readers
+    ## the pixels' color space; empty for none.
+    pub var icc_profile: const u8[]
 
 ## Encode `width` x `height` RGBA pixels (row after row) as a PNG appended to `output`.
 pub func encode_rgba8(pixels: const u8[], width: usize, height: usize, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> !:

@@ -73,6 +73,8 @@ pub struct Encoder:
         header[9] = colors[nc - 1]
         try output.put(signature)
         try chunk(output, "IHDR", header)
+        if options.icc_profile.length > 0:
+            try write_icc(output, options.icc_profile)
         let zlib = flate.zlib_header(options.level)
         try chunk(output, "IDAT", zlib)
         return e
@@ -246,6 +248,18 @@ func put32(at: u8*, value: u32):
     at[3] = (u8)value
 
 ## Append a chunk: length, type, data and CRC.
+## An iCCP chunk holding `profile`: the keyword, a zero, compression method 0 and
+## the profile as a zlib stream.
+func write_icc(output: Buffer*, profile: const u8[]) -> !:
+    let keyword = b"ICC Profile"
+    let packed = try new u8[keyword.length + 2 + flate.deflate_bound(profile.length) + 6] --- in memory.heap
+    defer free(packed) in memory.heap
+    memory.copy(packed[..<keyword.length], keyword, keyword.length)
+    packed[keyword.length] = 0
+    packed[keyword.length + 1] = 0
+    let used = try flate.deflate_zlib(profile, 9, packed[keyword.length + 2..])
+    try chunk(output, "iCCP", packed[..<keyword.length + 2 + used])
+
 func chunk(output: Buffer*, name: str, data: const u8[]) -> !:
     var length: u8[4]
     put32(&length[0], (u32)data.length)

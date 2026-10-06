@@ -365,3 +365,35 @@ func with_profile(found: const Info*) -> const u8[]:
     with memory.heap:
         let profile = icc_profile(found) else trap("the profile inflates")
         return profile else trap("there is a profile")
+
+## An ICC profile libpng accepts: a v4 RGB monitor header, no tags, and varied
+## bytes after it, so it stays larger than libpng's shortest iCCP chunk compressed.
+func tiny_profile(out: u8[]):
+    for at in 0..<out.length:
+        out[at] = (u8)((at * 131 + 7) % 251) if at >= 132 else 0
+    out[2] = (u8)(out.length >> 8)
+    out[3] = (u8)out.length
+    out[8] = 4
+    out[9] = 0x30
+    for (at, byte) in b"mntrRGB XYZ ".indexed():
+        out[12 + at] = byte
+    for (at, byte) in b"acsp".indexed():
+        out[36 + at] = byte
+    # The D50 illuminant, s15Fixed16: 0.9642, 1.0, 0.8249.
+    let illuminant: u8[12] = [0, 0, 0xF6, 0xD6, 0, 1, 0, 0, 0, 0, 0xD3, 0x2D]
+    for at in 0..<(usize)12:
+        out[68 + at] = illuminant[at]
+
+test "an embedded ICC profile reads back":
+    var profile: u8[1024]
+    tiny_profile(profile)
+    var pixels: u8[64]
+    var output = Buffer()
+    defer output.close()
+    try encode_rgba8(pixels, 4, 4, &output, EncodeOptions(icc_profile = profile))
+    let found = try info(output.data[..<output.used])
+    let read = (try icc_profile(&found)) else trap("the iCCP profile did not read back")
+    defer free(read)
+    assert(read.length == 1024)
+    for at in 0..<(usize)1024:
+        assert(read[at] == profile[at])
