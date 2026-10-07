@@ -1,0 +1,14 @@
+# luce-png's drivers against the fixtures and the reference decoders: gate.py builds them in
+# native and C modes and checks them (see its description). Pillow, when Python has it,
+# adds the comparisons with the reference library.
+from luce_std import process
+
+let failed = ErrorCode.package(1)
+
+pub func main(arguments: list[str]) -> int!:
+    let here = process.variable("LUC_TEST_DIR") else "tests/drivers"
+    let done = process.run("python3", [f"{here}/gate.py"])
+    print(done.output.trim_end())
+    if done.exit_code != 0:
+        error(failed, f"gate.py: exit status {done.exit_code}\n{done.error_output}")
+    return 0

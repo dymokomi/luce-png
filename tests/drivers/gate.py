@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""luce-png's gate: the module's test blocks, then the drivers in native and C modes:
+"""luce-png's drivers, run by tests/drivers/main.luc (`luc test`, which runs the module's test
+blocks itself): in native and C modes:
 
 - every fixture decodes through the Raster API to exactly the samples of the 0.1
   decoder built the same way (tests/fixtures/golden.txt);
@@ -21,10 +22,10 @@
 import hashlib, os, random, struct, subprocess, tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-BASE = Path(os.environ.get("LUCE_BASE", ROOT.parent / "luce-base/build/luce-base")).resolve()
+ROOT = Path(__file__).resolve().parents[2]
+BASE = os.environ.get("LUCE_BASE", "luce-base")
 MODES = [["--native"], ["--backend=c"]]
-env = dict(os.environ, LUCE_BASE=str(BASE), LUCE_STD=os.environ.get("LUCE_STD", str((ROOT.parent / "luce-base/src/std").resolve())))
+env = dict(os.environ, LUCE_BASE=str(BASE))
 FIXTURES = sorted((ROOT / "tests/fixtures").glob("*.png"))
 GOLDEN = {}
 for line in (ROOT / "tests/fixtures/golden.txt").read_text().splitlines():
@@ -229,7 +230,6 @@ for flags in MODES + [["--profile", "diagnostic"]]:
         with tempfile.TemporaryDirectory(prefix="luce-png-") as name:
             check_apng(Path(name), flags)
         continue
-    run([BASE, "test", ROOT / "src/png", *flags], check=True)
     with tempfile.TemporaryDirectory(prefix="luce-png-") as name:
         tmp = Path(name)
         dump, tool = tmp / "dump", tmp / "tool"

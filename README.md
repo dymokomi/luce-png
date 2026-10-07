@@ -118,7 +118,7 @@ Decoding a libpng photo is bound by inflating one stream on one thread.
 ## Tests
 
 ```
-./test.sh    # module tests, then the drivers in native and C modes against tests/fixtures
+luc test     # module tests, then tests/drivers in native and C modes against tests/fixtures
 ```
 
 `tests/fixtures/golden.txt` holds the 0.1 decoder's samples for every fixture (made by `tests/make_fixtures.py`: every color type, depth, filter and interlacing, and Pillow's files). The gate checks every decoding API against them and, with Pillow, against libpng; that the encoder is lossless in all eight formats and gives the same bytes across threads and streaming; and that damaged files fail cleanly.
