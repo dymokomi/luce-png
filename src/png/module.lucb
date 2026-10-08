@@ -37,6 +37,7 @@
 import memory
 import thread
 import os
+import strings
 from luce_compress import flate
 from luce_raster.binary import Reader, Buffer
 from luce_raster.model import Raster, SampleType

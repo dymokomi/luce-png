@@ -686,10 +686,12 @@ struct EarlyPass:
     var sink: CoarseSink?
     var context: void*?
     var done: bool
-    ## A failure in the inflater's progress, which cannot fail itself.
+    ## A failure in the inflater's progress, which cannot fail itself: its message copied
+    ## into `room`, since the handler that caught it gives the original back when it finishes (base.md §11.3).
     var failed: bool
     var code: ErrorCode
     var message: str
+    var room: u8[256]
 
 ## The inflater's progress: once pass 1 is in, it goes to the sink.
 func early_progress(context: void*?, produced: usize):
@@ -706,7 +708,7 @@ func early_progress(context: void*?, produced: usize):
     first_pass(early, w, h, stride) catch failure:
         early.failed = true
         early.code = failure.code
-        early.message = failure.message
+        early.message = strings.copy_into(early.room, failure.message)
         recover ()
 
 ## Pass 1 unfiltered (a copy: the rows are unfiltered in place later) and

@@ -315,7 +315,6 @@ test "the start of a file up to its first IDAT probes as the file whole":
 # mark: Color chunks ==========================================================================
 from luce_std import files
 import c as libc
-import strings
 
 ## The bytes of tests/fixtures/color/NAME, kept in the heap for the run (tests run from the
 ## repository root).

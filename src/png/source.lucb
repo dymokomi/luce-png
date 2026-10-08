@@ -108,10 +108,12 @@ struct Feed:
     ## a few bytes ahead, so the stream's end may lie just before it).
     var tail: u8[8]
     var tail_length: usize
-    ## A failure inside `more`, which cannot fail itself.
+    ## A failure inside `more`, which cannot fail itself: its message copied into
+    ## `failure_room`, since the handler that caught it gives the original back when it finishes (base.md §11.3).
     var failed: bool
     var failure_code: ErrorCode
     var failure: str
+    var failure_room: u8[256]
 
     static func open(read: ReadAt, source: void*?, size: u64, parsed: const Parsed*) -> Feed!:
         return Feed(read = read, source = source, size = size, parsed = parsed, block = try new u8[feed_block] --- in memory.heap,
@@ -209,7 +211,7 @@ func more_of(feed: Feed*) -> const u8[]:
     return feed.next() catch failure:
         feed.failed = true
         feed.failure_code = failure.code
-        feed.failure = failure.message
+        feed.failure = strings.copy_into(feed.failure_room, failure.message)
         recover feed.block[..<0]
 
 ## Decode the `size`-byte PNG file `read` gives in bands of whole rows, each
